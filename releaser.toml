@@ -1,14 +1,14 @@
 [version]
 channel = "Nightly"
 major = 0
-minor = 2
+minor = 3
 patch = 0
 revision = 0
-
-[settings]
-git_url_prefix = "https://github.com/ginger-society/ginger-infra"
 
 [[references]]
 file_name = "Cargo.toml"
 output_type = "String"
 variable = "version"
+
+[settings]
+git_url_prefix = "https://github.com/ginger-society/ginger-infra"

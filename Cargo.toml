@@ -2,7 +2,7 @@
 description = "Inra related command"
 edition = "2021"
 name = "ginger-infra"
-version = "0.1.0"
+version = "0.3.0-nightly.0"
 
 [package.metadata]
 organization = "ginger-society"
