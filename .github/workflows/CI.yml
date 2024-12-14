@@ -1,0 +1,34 @@
+name: Build, Push Docker Image, and Restart Deployment
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Install ginger-apps
+      run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/rust-helpers/install-pipeline-clis.sh)"
+
+    - name: Authenticate with ginger-auth
+      id: ginger-auth
+      run: ginger-auth token-login ${{ secrets.GINGER_TOKEN }}
+
+    - name: Update pipeline to running
+      run: ginger-connector update-pipeline stage running
+
+    - name: Fetch the latest version of internal packages
+      run: ginger-connector refresh
+    
+    - name: Build Docker image
+      run: docker build . --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }}
+
+    - name: Update pipeline to passing
+      run: ginger-connector update-pipeline stage passing

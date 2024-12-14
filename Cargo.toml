@@ -1,5 +1,5 @@
 [package]
-description = "Inra related command"
+description = "Infra related commands"
 edition = "2021"
 name = "ginger-infra"
 version = "0.3.0-nightly.0"
