@@ -1,0 +1,38 @@
+dir = "."
+lang = "Rust"
+organization_id = "ginger-society"
+spec_url = "/openapi.json"
+
+[services."@ginger-society/IAMService"]
+dev = "http://localhost:8080/iam"
+stage = "https://api-staging.gingersociety.org/iam"
+stage_k8 = "http://iam-service-api-service/iam"
+
+[services."@ginger-society/MetadataService"]
+dev = "http://localhost:8081/metadata"
+stage = "https://api-staging.gingersociety.org/metadata"
+stage_k8 = "http://metadata-service-api-service/metadata"
+
+[portals_refs]
+
+[ws_refs."@ginger-society/IAMService"]
+stage = ""
+stage_k8 = ""
+
+[ws_refs."@ginger-society/MetadataService"]
+stage = ""
+stage_k8 = ""
+
+[urls]
+
+[urls_ws]
+
+[portal_config]
+allow_registration = true
+auth_redirection_path = "/#/handle-auth/"
+disabled = false
+friendly_name = "Dev Portal"
+has_web_interface = true
+id = "dev-portal-staging"
+logo_url = "https://www.gingersociety.org/img/ginger-dev-portal-icon.png"
+tnc_url = "https://www.gingersociety.org/terms-of-use/"
