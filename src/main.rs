@@ -18,24 +18,14 @@ mod portalInstaller;
 enum Commands {
     /// Initialize a infra project
     Init,
-    /// adds env
-    AddEnv,
-    /// adds redis
-    AddCache,
-    /// adds rabbitMQ
-    AddMessageQueue,
-    /// only the exporter
-    AddRDBMS,
-    /// Apply
-    Apply,
-    /// build all the infra base images, basically triggers the CI pipeline in the infra repo
-    Build,
-    /// build cli in the current working dir , this requires the GH_TOKEN env to be present in the current shell session. Supposed to be a dev machine but can also be triggered as part of pipeline which is building a component the infra dependes on
-    BuildCli,
-    /// upload cli , this requires AWS credentials to be present in the system , supposed to be run on a dev machine.
-    UploadCli,
-    /// installs a portal , creates an entry in the application table in dev portal
+
+    ApplyDB,
+    /// generate resources from db-compose.toml file
+    ApplySnapshot,
+    /// installs a portal , creates an entry in the application table in IAM db
     InstallOrUpdatePortal,
+    /// deploy by applying in order to a k8 cluster , should take a kubeconfig as an argument , this should also make sure that the DB migrations are run
+    Deploy
 }
 
 #[derive(Parser, Debug)]
@@ -63,33 +53,19 @@ async fn check_session_gurad(
                 Commands::Init => {
                     println!("Hello, world!");
                 }
-                Commands::AddEnv => {
-                    //  create a folder in environments folder and adds ingress , ssl and other common resources
+                Commands::ApplyDB => {
+                    // generate resources from db-compose.toml file
                     println!("Hello, world!");
                 }
-                Commands::AddCache => {
-                    // adds reddis cache and deployment service
-                    println!("Hello, world!");
-                }
-                Commands::AddMessageQueue => {
-                    // adds rabbitmq deployment and service
-                    println!("Hello, world!");
-                }
-                Commands::AddRDBMS => {
-                    // only the exporter deployment and service, or in future a multi read and write replica using helm could be possible
-                    println!("Hello, world!");
-                }
-                Commands::Apply => {
+                Commands::ApplySnapshot => {
                     // applies a snapshot version in a given environment
                     println!("Hello, world!");
                 }
-                Commands::Build => todo!(),
-                Commands::BuildCli => todo!(),
-                Commands::UploadCli => todo!(),
                 Commands::InstallOrUpdatePortal => {
                     install_or_update_portal(config_path, &iam_config, releaser_path, package_path)
                         .await
                 }
+                Commands::Deploy => todo!(),
             }
 
             // println!("Token is valid: {:?}", response)
