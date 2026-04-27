@@ -2,3 +2,4 @@
 IAMService_client
 MetadataService_client
 .ginger.tmp
+.DS_Store
