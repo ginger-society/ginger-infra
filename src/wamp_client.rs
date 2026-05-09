@@ -184,9 +184,7 @@ impl WampClient {
     /// Fire-and-forget publish to any topic.
     /// `listen()` must be running (e.g. in a spawned task) before calling this.
     pub async fn publish(&self, topic: &str, kwargs: Value) -> Result<(), String> {
-        if !self.is_connected() {
-            return Err("not connected".to_string());
-        }
+        
         let guard = self.publish_tx.lock().await;
         let tx = guard
             .as_ref()
