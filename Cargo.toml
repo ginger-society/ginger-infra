@@ -18,3 +18,5 @@ tokio-tungstenite = { version = "0.26.2", features = ["tokio-native-tls", "nativ
 futures-util = "0.3.31"
 serde = {version = "1.0.166", features = ["derive"]}
 serde_json = {version = "1.0.100"}
+sysinfo = "0.30"
+

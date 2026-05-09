@@ -15,6 +15,7 @@ use tokio::main;
 mod portalInstaller;
 mod start;
 mod wamp_client;
+mod heartbeat;
 
 #[derive(Subcommand, Debug)]
 enum Commands {

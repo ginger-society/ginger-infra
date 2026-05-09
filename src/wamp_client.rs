@@ -2,9 +2,9 @@
 //
 // Declarative WAMP-like client for the GingerSociety notification broker.
 //
-// Usage (callee / service daemon):
+// Usage (callee / service):
 // ─────────────────────────────────
-//   let mut client = WampClient::new("ginger_infra", access_token, sub).await;
+//   let mut client = WampClient::new("ginger_infra", access_token, realm).await;
 //
 //   client.register("snap_install", |args, kwargs| async move {
 //       let package = args[0].as_str().unwrap_or("").to_string();
@@ -15,15 +15,20 @@
 //
 // Usage (caller / any other service):
 // ─────────────────────────────────────
-//   let client = WampClient::new("my_service", access_token, sub).await;
+//   let client = WampClient::new("my_service", access_token, realm).await;
 //
 //   let result = client.call(
 //       "ginger_infra",          // target service prefix
-//       workspace_id,            // target workspace sub
+//       workspace_id,            // target workspace realm
 //       "snap_install",          // function name
 //       json!(["certbot"]),      // args
 //       json!({"classic": true}),// kwargs
 //   ).await?;
+//
+// Usage (fire-and-forget publish):
+// ─────────────────────────────────
+//   // listen() must be running (in a spawned task) before calling publish()
+//   client.publish("some.topic", json!({"key": "value"})).await?;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -99,10 +104,13 @@ pub type Handler = Arc<
         + Send
         + Sync,
 >;
-
 // ── pending call tracker (for caller side) ───────────────────────────────────
 
 type PendingCalls = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
+
+// ── outbound publish channel ──────────────────────────────────────────────────
+
+type PublishTx = Arc<Mutex<Option<tokio::sync::mpsc::Sender<WampPublish>>>>;
 
 // ── WampClient ────────────────────────────────────────────────────────
 
@@ -119,13 +127,15 @@ pub struct WampClient {
     handlers: Arc<Mutex<HashMap<String, Handler>>>,
     /// Pending outbound calls waiting for a reply (caller side)
     pending: PendingCalls,
+    /// Sender half of the outbound publish channel; None until listen() starts
+    publish_tx: PublishTx,
 }
 
 impl WampClient {
     /// Create a new client.
     /// `prefix`       — service name e.g. "ginger_infra"
     /// `access_token` — JWT used to authenticate the WebSocket
-    /// `realm`          — token subject (workspace id); channel = "{prefix}_{sub}"
+    /// `realm`        — token subject (workspace id); channel = "{prefix}_{sub}"
     pub fn new(prefix: &str, access_token: &str, realm: &str) -> Self {
         let broker_url = std::env::var("NOTIFICATION_BROKER_URL")
             .unwrap_or_else(|_| "wss://api.gingersociety.org".to_string());
@@ -143,6 +153,7 @@ impl WampClient {
             url,
             handlers: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            publish_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -161,8 +172,33 @@ impl WampClient {
         println!("[client] registered handler for '{}'", function);
     }
 
+    /// Fire-and-forget publish to any topic.
+    /// `listen()` must be running (e.g. in a spawned task) before calling this.
+    pub async fn publish(&self, topic: &str, kwargs: Value) -> Result<(), String> {
+        let guard = self.publish_tx.lock().await;
+        let tx = guard
+            .as_ref()
+            .ok_or_else(|| "not connected — call listen() first".to_string())?;
+
+        let msg = WampPublish {
+            message_type: 16,
+            request_id: rand_u64(),
+            options: WampPublishOptions {
+                acknowledge: false,
+                correlation_id: None,
+                reply_to: None,
+            },
+            topic: topic.to_string(),
+            args: None,
+            kwargs: Some(kwargs),
+        };
+
+        tx.send(msg).await.map_err(|e| e.to_string())
+    }
+
     /// Start listening — blocks until shutdown signal.
     /// Dispatches incoming RPC calls to registered handlers and sends results back.
+    /// Also drains the outbound publish channel onto the websocket.
     pub async fn listen(&self) {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -188,6 +224,11 @@ impl WampClient {
             let _ = shutdown_tx.send(true);
         });
 
+        // create the outbound publish channel and store the sender so publish() can use it
+        let (pub_tx, mut pub_rx) = tokio::sync::mpsc::channel::<WampPublish>(32);
+        *self.publish_tx.lock().await = Some(pub_tx);
+
+        let heartbeat_topic = format!("heartbeat.{}_{}", self.prefix, self.realm);
         let mut attempt: u32 = 0;
 
         loop {
@@ -241,7 +282,12 @@ impl WampClient {
             let mut ping_interval = tokio::time::interval(
                 tokio::time::Duration::from_secs(PING_INTERVAL_SECS),
             );
-            ping_interval.tick().await;
+            ping_interval.tick().await; // discard immediate tick
+
+            let mut heartbeat_interval = tokio::time::interval(
+                tokio::time::Duration::from_secs(5),
+            );
+            heartbeat_interval.tick().await; // discard immediate tick
 
             let mut waiting_for_pong = false;
             let mut pong_timeout: Option<Pin<Box<tokio::time::Sleep>>> = None;
@@ -282,6 +328,37 @@ impl WampClient {
                         break;
                     }
 
+                    _ = heartbeat_interval.tick() => {
+                        let stats = crate::heartbeat::collect_stats();
+                        let publish = WampPublish {
+                            message_type: 16,
+                            request_id: rand_u64(),
+                            options: WampPublishOptions {
+                                acknowledge: false,
+                                correlation_id: None,
+                                reply_to: None,
+                            },
+                            topic: heartbeat_topic.clone(),
+                            args: None,
+                            kwargs: Some(stats),
+                        };
+                        let msg = serde_json::to_string(&publish).unwrap();
+                        if let Err(e) = ws_stream.send(Message::Text(msg.into())).await {
+                            eprintln!("[client] heartbeat publish failed: {:?} — reconnecting...", e);
+                            break;
+                        }
+                        println!("[client] ♥ heartbeat → {}", heartbeat_topic);
+                    }
+
+                    Some(outbound) = pub_rx.recv() => {
+                        let msg = serde_json::to_string(&outbound).unwrap();
+                        if let Err(e) = ws_stream.send(Message::Text(msg.into())).await {
+                            eprintln!("[client] outbound publish failed: {:?} — reconnecting...", e);
+                            break;
+                        }
+                        println!("[client] → PUBLISH topic='{}'", outbound.topic);
+                    }
+
                     msg_result = ws_stream.next() => {
                         match msg_result {
                             Some(Ok(msg)) => {
@@ -299,10 +376,7 @@ impl WampClient {
                                 let text = msg.into_text().unwrap_or_default();
                                 if text.is_empty() { continue; }
 
-                                self.handle_message(
-                                    &text,
-                                    &mut ws_stream,
-                                ).await;
+                                self.handle_message(&text, &mut ws_stream).await;
                             }
                             Some(Err(e)) => {
                                 eprintln!("[client] ws error: {:?} — reconnecting...", e);
@@ -335,11 +409,7 @@ impl WampClient {
         let correlation_id = format!("corr-{}", uuid());
         let reply_to = self.channel.clone();
 
-        // merge function + correlation_id into kwargs
-        let mut kw = kwargs
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
+        let mut kw = kwargs.as_object().cloned().unwrap_or_default();
         kw.insert("function".to_string(), Value::String(function.to_string()));
         kw.insert("correlation_id".to_string(), Value::String(correlation_id.clone()));
         kw.insert("reply_to".to_string(), Value::String(reply_to.clone()));
@@ -357,27 +427,19 @@ impl WampClient {
             kwargs: Some(Value::Object(kw)),
         };
 
-        // register pending call — reply comes back as a WampEvent on our channel
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
             .await
             .insert(correlation_id.clone(), tx);
 
-        // publish — the caller needs its own WS connection open (listen() running)
-        // for the reply to arrive; for fire-and-forget use publish_event() instead
         println!(
             "[client] → CALL fn='{}' corr={} target='{}'",
             function, correlation_id, publish.topic
         );
 
-        // NOTE: publishing is done via the broker REST endpoint for simplicity.
-        // If you need call() without listen() running, use the HTTP publish route.
-        // For now, callers are expected to also be running listen() so the reply
-        // arrives on their own channel.
         let _ = serde_json::to_string(&publish).unwrap();
 
-        // wait for reply with a 30s timeout
         match tokio::time::timeout(tokio::time::Duration::from_secs(30), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("reply channel dropped".to_string()),
@@ -397,14 +459,12 @@ impl WampClient {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) {
-        // broker error (callee_offline, callee_timeout, callee_disconnected)
         if let Ok(err) = serde_json::from_str::<BrokerError>(text) {
             if err.message_type == 0 {
                 println!(
                     "[client] ← BROKER ERROR: {} corr={:?}",
                     err.error, err.correlation_id
                 );
-                // resolve pending call with error
                 if let Some(corr_id) = &err.correlation_id {
                     if let Some(tx) = self.pending.lock().await.remove(corr_id) {
                         let _ = tx.send(Err(err.error.clone()));
@@ -414,7 +474,6 @@ impl WampClient {
             }
         }
 
-        // WampEvent — either an RPC call directed at us, or a reply to our call
         if let Ok(event) = serde_json::from_str::<WampEvent>(text) {
             let corr_id = event.details.correlation_id.clone();
             let reply_to = event.details.reply_to.clone();
@@ -426,7 +485,6 @@ impl WampClient {
 
             match function {
                 Some(fn_name) => {
-                    // incoming RPC call — dispatch to handler
                     self.dispatch_rpc(
                         fn_name,
                         event.args.clone(),
@@ -438,7 +496,6 @@ impl WampClient {
                     .await;
                 }
                 None => {
-                    // no function field — this is a reply to one of our calls
                     if let Some(ref cid) = corr_id {
                         if let Some(tx) = self.pending.lock().await.remove(cid) {
                             let result = event.kwargs
@@ -447,7 +504,6 @@ impl WampClient {
                             let _ = tx.send(Ok(result));
                         }
                     } else {
-                        // plain event / notification — just print
                         println!("[client] ← EVENT {}", text);
                     }
                 }
@@ -455,7 +511,6 @@ impl WampClient {
             return;
         }
 
-        // unknown message
         println!("[client] ← UNKNOWN {}", text);
     }
 
@@ -475,7 +530,6 @@ impl WampClient {
         match handler {
             None => {
                 eprintln!("[client] no handler registered for '{}'", function);
-                // send error back to caller if RPC-style
                 if let (Some(corr_id), Some(rt)) = (correlation_id, reply_to) {
                     let reply = make_reply(
                         &self.channel,
@@ -493,7 +547,6 @@ impl WampClient {
                 println!("[client] ← CALL fn='{}' corr={:?}", function, correlation_id);
                 let result = h(args, kwargs).await;
 
-                // send result back if RPC-style
                 if let (Some(corr_id), Some(rt)) = (correlation_id, reply_to) {
                     let payload = match result {
                         Ok(v) => v,
@@ -523,7 +576,10 @@ fn make_reply(
 ) -> WampPublish {
     let mut kw = serde_json::Map::new();
     kw.insert("is_result".to_string(), Value::Bool(true));
-    kw.insert("correlation_id".to_string(), Value::String(correlation_id.to_string()));
+    kw.insert(
+        "correlation_id".to_string(),
+        Value::String(correlation_id.to_string()),
+    );
     if is_error {
         kw.insert("is_error".to_string(), Value::Bool(true));
     }
@@ -538,12 +594,17 @@ fn make_reply(
         },
         topic: reply_to.to_string(),
         args: None,
-        kwargs: Some(Value::Object(kw.into_iter().chain(
-            payload.as_object()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-        ).collect())),
+        kwargs: Some(Value::Object(
+            kw.into_iter()
+                .chain(
+                    payload
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter(),
+                )
+                .collect(),
+        )),
     }
 }
 

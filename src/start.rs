@@ -16,7 +16,7 @@ struct AptArgs {
 
 
 pub async fn main(access_token: String, token_response: ValidateApiTokenResponse) {
-    let client = WampClient::new(
+    let client: WampClient = WampClient::new(
         "ginger_infra",        // prefix — channel = "ginger_infra_{realm}"
         &access_token,
         &token_response.sub,   // realm comes from the validated token
