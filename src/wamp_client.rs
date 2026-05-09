@@ -326,12 +326,12 @@ impl WampClient {
     pub async fn call(
         &self,
         target_prefix: &str,
-        target_sub: &str,
+        target_realm: &str,
         function: &str,
         args: Value,
         kwargs: Value,
     ) -> Result<Value, String> {
-        let target_channel = format!("{}_{}", target_prefix, target_sub);
+        let target_channel = format!("{}_{}", target_prefix, target_realm);
         let correlation_id = format!("corr-{}", uuid());
         let reply_to = self.channel.clone();
 
