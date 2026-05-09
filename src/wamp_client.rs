@@ -110,7 +110,7 @@ pub struct WampClient {
     /// Service prefix e.g. "ginger_infra"
     prefix: String,
     /// Token sub — workspace/user id
-    sub: String,
+    realm: String,
     /// Full channel name = "{prefix}_{sub}"
     channel: String,
     /// WebSocket URL
@@ -125,12 +125,12 @@ impl WampClient {
     /// Create a new client.
     /// `prefix`       — service name e.g. "ginger_infra"
     /// `access_token` — JWT used to authenticate the WebSocket
-    /// `sub`          — token subject (workspace id); channel = "{prefix}_{sub}"
-    pub fn new(prefix: &str, access_token: &str, sub: &str) -> Self {
+    /// `realm`          — token subject (workspace id); channel = "{prefix}_{sub}"
+    pub fn new(prefix: &str, access_token: &str, realm: &str) -> Self {
         let broker_url = std::env::var("NOTIFICATION_BROKER_URL")
             .unwrap_or_else(|_| "wss://api.gingersociety.org".to_string());
 
-        let channel = format!("{}_{}", prefix, sub);
+        let channel = format!("{}_{}", prefix, realm);
         let url = format!(
             "{}/notification/ws/{}?token={}",
             broker_url, channel, access_token
@@ -138,7 +138,7 @@ impl WampClient {
 
         Self {
             prefix: prefix.to_string(),
-            sub: sub.to_string(),
+            realm: realm.to_string(),
             channel,
             url,
             handlers: Arc::new(Mutex::new(HashMap::new())),
@@ -561,4 +561,18 @@ fn uuid() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis()
+}
+
+#[macro_export]
+macro_rules! wamp_args {
+    ($args:expr) => {
+        $args
+            .as_ref()
+            .and_then(|a| a.get(0))
+            .ok_or_else(|| "missing args".to_string())
+            .and_then(|v| {
+                serde_json::from_value(v.clone())
+                    .map_err(|e| format!("invalid args: {}", e))
+            })
+    };
 }
