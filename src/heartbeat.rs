@@ -32,11 +32,11 @@ pub fn collect_stats() -> Value {
         .iter()
         .map(|d| {
             json!({
-                "mount":       d.mount_point().to_string_lossy(),
-                "total_gb":    mb(d.total_space()),
-                "available_gb": mb(d.available_space()),
-                "used_pct":    usage_pct(d.total_space(), d.available_space()),
-                "fs":          d.file_system().to_string_lossy(),
+                "mount":        d.mount_point().to_string_lossy(),
+                "total_mb":     mb(d.total_space()),
+                "available_mb": mb(d.available_space()),
+                "used_pct":     usage_pct(d.total_space(), d.available_space()),
+                "fs":           d.file_system().to_string_lossy(),
             })
         })
         .collect();

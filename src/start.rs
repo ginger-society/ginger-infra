@@ -34,6 +34,7 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
         println!("Updating apt on port: {}", parsed.port);
         println!("Updating apt...");
         Ok(json!({"status": "done"}))
+        
     }).await;
 
     client.listen().await;

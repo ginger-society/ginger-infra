@@ -41,6 +41,8 @@ use serde_json::Value;
 use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 
 // ── WAMP-style message types (mirrors broker's requests.rs) ──────────────────
 
@@ -129,6 +131,8 @@ pub struct WampClient {
     pending: PendingCalls,
     /// Sender half of the outbound publish channel; None until listen() starts
     publish_tx: PublishTx,
+    /// True while the WebSocket connection is alive
+    pub is_connected: Arc<AtomicBool>,
 }
 
 impl WampClient {
@@ -154,7 +158,12 @@ impl WampClient {
             handlers: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             publish_tx: Arc::new(Mutex::new(None)),
+            is_connected: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.is_connected.load(Ordering::Relaxed)
     }
 
     /// Register an RPC handler for a function name.
@@ -175,6 +184,9 @@ impl WampClient {
     /// Fire-and-forget publish to any topic.
     /// `listen()` must be running (e.g. in a spawned task) before calling this.
     pub async fn publish(&self, topic: &str, kwargs: Value) -> Result<(), String> {
+        if !self.is_connected() {
+            return Err("not connected".to_string());
+        }
         let guard = self.publish_tx.lock().await;
         let tx = guard
             .as_ref()
@@ -264,6 +276,7 @@ impl WampClient {
             let mut ws_stream = match conn {
                 Ok(Ok((stream, _))) => {
                     println!("✅ [client] connected on channel '{}'", self.channel);
+                    self.is_connected.store(true, Ordering::Relaxed);
                     attempt = 0;
                     stream
                 }
@@ -298,6 +311,7 @@ impl WampClient {
 
                     _ = shutdown_rx.changed() => {
                         println!("[client] shutting down, closing connection...");
+                        self.is_connected.store(false, Ordering::Relaxed);
                         let _ = ws_stream.close(None).await;
                         while let Some(Ok(msg)) = ws_stream.next().await {
                             if msg.is_close() { break; }
@@ -390,7 +404,7 @@ impl WampClient {
                     }
                 }
             }
-
+            self.is_connected.store(false, Ordering::Relaxed);
             attempt += 1;
         }
     }
