@@ -11,21 +11,24 @@ use MetadataService::{
     apis::configuration::Configuration as MetadataConfiguration,
     get_configuration as get_metadata_configuration,
 };
-
+use tokio::main;
 mod portalInstaller;
+mod start;
+mod wamp_client;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize a infra project
     Init,
-
-    ApplyDB,
-    /// generate resources from db-compose.toml file
+    /// gives the option to select an item from the dev portal and generate its deployment , service and update ingress
+    Add,
+    // after taking a snapshot using ginger-releaser , we can apply it using this - this might be a stop action , but can be called immediately after the releaser command
     ApplySnapshot,
-    /// installs a portal , creates an entry in the application table in IAM db
+    /// installs a portal , creates an entry in the application table in IAM db, this should be run in the FE app repo
     InstallOrUpdatePortal,
     /// deploy by applying in order to a k8 cluster , should take a kubeconfig as an argument , this should also make sure that the DB migrations are run
-    Deploy
+    Deploy,
+    Start
 }
 
 #[derive(Parser, Debug)]
@@ -38,7 +41,7 @@ struct Args {
     command: Commands,
 }
 
-#[tokio::main]
+
 async fn check_session_gurad(
     cli: Args,
     config_path: &Path,
@@ -46,6 +49,7 @@ async fn check_session_gurad(
     metadata_config: &MetadataConfiguration,
     package_path: &Path,
     releaser_path: &Path,
+    token: String,
 ) {
     match identity_validate_api_token(&iam_config).await {
         Ok(response) => {
@@ -53,7 +57,7 @@ async fn check_session_gurad(
                 Commands::Init => {
                     println!("Hello, world!");
                 }
-                Commands::ApplyDB => {
+                Commands::Add => {
                     // generate resources from db-compose.toml file
                     println!("Hello, world!");
                 }
@@ -66,6 +70,9 @@ async fn check_session_gurad(
                         .await
                 }
                 Commands::Deploy => todo!(),
+                Commands::Start => {
+                    start::main(token.clone(), response).await;
+                },
             }
 
             // println!("Token is valid: {:?}", response)
@@ -77,7 +84,8 @@ async fn check_session_gurad(
     }
 }
 
-fn main() {
+#[main]
+async fn main() {
     let args = Args::parse();
     let token = get_token_from_file_storage();
     let metadata_config: MetadataConfiguration = get_metadata_configuration(Some(token.clone()));
@@ -86,6 +94,8 @@ fn main() {
     let package_path = Path::new("metadata.toml");
     let releaser_path = Path::new("releaser.toml");
 
+    
+
     check_session_gurad(
         args,
         service_config_path,
@@ -93,5 +103,6 @@ fn main() {
         &metadata_config,
         package_path,
         releaser_path,
-    );
+        token,
+    ).await;
 }

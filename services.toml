@@ -5,12 +5,12 @@ spec_url = "/openapi.json"
 
 [services."@ginger-society/IAMService"]
 dev = "http://localhost:8080/iam"
-stage = "https://api-staging.gingersociety.org/iam"
+stage = "https://api.gingersociety.org/iam"
 stage_k8 = "http://iam-service-api-service/iam"
 
 [services."@ginger-society/MetadataService"]
 dev = "http://localhost:8081/metadata"
-stage = "https://api-staging.gingersociety.org/metadata"
+stage = "https://api.gingersociety.org/metadata"
 stage_k8 = "http://metadata-service-api-service/metadata"
 
 [portals_refs]

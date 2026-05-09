@@ -14,3 +14,7 @@ clap = {version = "4.5.7", features = ["derive"]}
 colored = {version = "2.0.1"}
 ginger-shared-rs = {version = "0.50.0-nightly.0", organization = "ginger-society"}
 tokio = {version = "1", features = ["full"]}
+tokio-tungstenite = { version = "0.26.2", features = ["tokio-native-tls", "native-tls"] }
+futures-util = "0.3.31"
+serde = {version = "1.0.166", features = ["derive"]}
+serde_json = {version = "1.0.100"}
