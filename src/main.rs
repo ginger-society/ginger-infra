@@ -72,7 +72,7 @@ async fn check_session_gurad(
                 }
                 Commands::Deploy => todo!(),
                 Commands::Start => {
-                    start::main(token.clone(), response).await;
+                    start::main(token.clone(), response, &metadata_config).await;
                 },
             }
 

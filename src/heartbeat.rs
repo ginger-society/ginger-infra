@@ -42,6 +42,7 @@ pub fn collect_stats() -> Value {
         .collect();
 
     json!({
+        "version": env!("CARGO_PKG_VERSION"),
         "cpu": {
             "global_usage_pct": (global_cpu * 10.0).round() / 10.0,
             "cores": per_core,
