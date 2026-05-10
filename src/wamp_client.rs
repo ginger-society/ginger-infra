@@ -184,7 +184,7 @@ impl WampClient {
     /// Fire-and-forget publish to any topic.
     /// `listen()` must be running (e.g. in a spawned task) before calling this.
     pub async fn publish(&self, topic: &str, kwargs: Value) -> Result<(), String> {
-        
+
         let guard = self.publish_tx.lock().await;
         let tx = guard
             .as_ref()
@@ -238,7 +238,6 @@ impl WampClient {
         let (pub_tx, mut pub_rx) = tokio::sync::mpsc::channel::<WampPublish>(32);
         *self.publish_tx.lock().await = Some(pub_tx);
 
-        let heartbeat_topic = format!("heartbeat.{}_{}", self.prefix, self.realm);
         let mut attempt: u32 = 0;
 
         loop {
@@ -248,7 +247,7 @@ impl WampClient {
             }
 
             if attempt > 0 {
-                let backoff = std::cmp::max(1, std::cmp::min(60, 2_u64.pow(attempt)));
+                let backoff = std::cmp::min(60, 1_u64.saturating_mul(attempt.min(6).into()));
                 println!(
                     "[client] reconnecting in {}s... (attempt #{})",
                     backoff,
@@ -295,10 +294,6 @@ impl WampClient {
             );
             ping_interval.tick().await; // discard immediate tick
 
-            let mut heartbeat_interval = tokio::time::interval(
-                tokio::time::Duration::from_secs(5),
-            );
-            heartbeat_interval.tick().await; // discard immediate tick
 
             let mut waiting_for_pong = false;
             let mut pong_timeout: Option<Pin<Box<tokio::time::Sleep>>> = None;
@@ -340,27 +335,7 @@ impl WampClient {
                         break;
                     }
 
-                    _ = heartbeat_interval.tick() => {
-                        let stats = crate::heartbeat::collect_stats();
-                        let publish = WampPublish {
-                            message_type: 16,
-                            request_id: rand_u64(),
-                            options: WampPublishOptions {
-                                acknowledge: false,
-                                correlation_id: None,
-                                reply_to: None,
-                            },
-                            topic: heartbeat_topic.clone(),
-                            args: None,
-                            kwargs: Some(stats),
-                        };
-                        let msg = serde_json::to_string(&publish).unwrap();
-                        if let Err(e) = ws_stream.send(Message::Text(msg.into())).await {
-                            eprintln!("[client] heartbeat publish failed: {:?} — reconnecting...", e);
-                            break;
-                        }
-                        println!("[client] ♥ heartbeat → {}", heartbeat_topic);
-                    }
+                    
 
                     Some(outbound) = pub_rx.recv() => {
                         let msg = serde_json::to_string(&outbound).unwrap();
