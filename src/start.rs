@@ -43,51 +43,7 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
         &token_response.sub,
     ));
 
-
-
-    client.register("setup_gateway", |args, _kwargs| async move {
-        let parsed: SetupGatewayArgs = wamp_args!(args)?;
     
-        println!(
-            "[setup_gateway] domain={} port={} websocket={}",
-            parsed.domain, parsed.port, parsed.websocket
-        );
-    
-        let mut cmd = tokio::process::Command::new("/usr/local/bin/setup-gateway.sh");
-        cmd.arg("--domain").arg(&parsed.domain)
-        .arg("--port").arg(parsed.port.to_string());
-    
-        if parsed.websocket {
-            cmd.arg("--websocket");
-        }
-    
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| json!({"error": format!("failed to run setup-gateway.sh: {}", e)}))?;
-    
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    
-        if !output.status.success() {
-            return Err(json!({
-                "error": "setup-gateway.sh failed",
-                "exit_code": output.status.code(),
-                "domain": parsed.domain,
-                "stdout": stdout,
-                "stderr": stderr,
-            }));
-        }
-    
-        Ok(json!({
-            "status": "configured",
-            "domain": parsed.domain,
-            "port": parsed.port,
-            "websocket": parsed.websocket,
-            "stdout": stdout,
-        }))
-    }).await;
-
     client.register("setup_gateway", |args, _kwargs| async move {
         let parsed: SetupGatewayArgs = wamp_args!(args)?;
     
