@@ -1,3 +1,7 @@
+## 0.5.0-nightly.0 - 2026-05-10
+chore:
+ - [05c21afcc7](https://github.com/ginger-society/ginger-infra05c21afcc78a042fee6ee0ecf4e4e7ddca6c10fe) (Ginger Society Admin) chore: version bump to 0.5.0-nightly.0
+	
 ## 0.4.0-nightly.0 - 2026-05-10
 fix:
  - [1eae6231d5](https://github.com/ginger-society/ginger-infra1eae6231d5af0aeb24948841d293e1f83b2cd7a1) (Ginger Society Admin) fix: pipeline
@@ -25,13 +29,13 @@ feat:
  - [0669b98399](https://github.com/ginger-society/ginger-infra0669b98399a293a3553e0f110bb48c09574c32f7) (Ginger Society Admin) feat: added pipeline
 	
 ## 0.3.0-nightly.0 - 2024-12-14
-chore:
- - [a5a9558fd2](https://github.com/ginger-society/ginger-infraa5a9558fd22f52be0c35f9770757c26b5a809160) (Ginger Society Admin) chore: version bump to 0.3.0-nightly.0
-	
 feat:
  - [7cb568703d](https://github.com/ginger-society/ginger-infra7cb568703d4e31c1e28f04700a3bec4d6e699e9d) (Ginger Society Admin) feat: updated metadata
 	
  - [22db393491](https://github.com/ginger-society/ginger-infra22db393491ceb7a49a304fac8849d759308935a6) (Ginger Society Admin) feat: updated metadata
+	
+chore:
+ - [a5a9558fd2](https://github.com/ginger-society/ginger-infraa5a9558fd22f52be0c35f9770757c26b5a809160) (Ginger Society Admin) chore: version bump to 0.3.0-nightly.0
 	
 ## 0.2.0-nightly.0 - 2024-12-14
 feat:

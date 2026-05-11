@@ -29,7 +29,12 @@ enum Commands {
     InstallOrUpdatePortal,
     /// deploy by applying in order to a k8 cluster , should take a kubeconfig as an argument , this should also make sure that the DB migrations are run
     Deploy,
-    Start
+    /// Start in daemon mode
+    Start {
+        /// Unique device identifier
+        #[arg(long)]
+        device_id: String,
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -71,8 +76,8 @@ async fn check_session_gurad(
                         .await
                 }
                 Commands::Deploy => todo!(),
-                Commands::Start => {
-                    start::main(token.clone(), response, &metadata_config).await;
+                Commands::Start {device_id}=> {
+                    start::main(token.clone(), response, &metadata_config, device_id).await;
                 },
             }
 

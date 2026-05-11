@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -41,8 +42,6 @@ use serde_json::Value;
 use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 
 // ── WAMP-style message types (mirrors broker's requests.rs) ──────────────────
 
@@ -100,15 +99,18 @@ pub struct BrokerError {
 
 // ── handler type ──────────────────────────────────────────────────────────────
 
-pub type HandlerResult = Result<Value, String>;
+/// Ok(Value) — success payload
+/// Err(Value) — error payload, will set is_error: true in the reply
+pub type HandlerResult = Result<Value, Value>;
 pub type Handler = Arc<
     dyn Fn(Option<Value>, Option<Value>) -> Pin<Box<dyn Future<Output = HandlerResult> + Send>>
         + Send
         + Sync,
 >;
+
 // ── pending call tracker (for caller side) ───────────────────────────────────
 
-type PendingCalls = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
+type PendingCalls = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, Value>>>>>;
 
 // ── outbound publish channel ──────────────────────────────────────────────────
 
@@ -167,7 +169,7 @@ impl WampClient {
     }
 
     /// Register an RPC handler for a function name.
-    /// The handler receives (args, kwargs) and returns a JSON result.
+    /// The handler receives (args, kwargs) and returns a JSON result or JSON error.
     pub async fn register<F, Fut>(&self, function: &str, handler: F)
     where
         F: Fn(Option<Value>, Option<Value>) -> Fut + Send + Sync + 'static,
@@ -184,7 +186,6 @@ impl WampClient {
     /// Fire-and-forget publish to any topic.
     /// `listen()` must be running (e.g. in a spawned task) before calling this.
     pub async fn publish(&self, topic: &str, kwargs: Value) -> Result<(), String> {
-
         let guard = self.publish_tx.lock().await;
         let tx = guard
             .as_ref()
@@ -294,7 +295,6 @@ impl WampClient {
             );
             ping_interval.tick().await; // discard immediate tick
 
-
             let mut waiting_for_pong = false;
             let mut pong_timeout: Option<Pin<Box<tokio::time::Sleep>>> = None;
 
@@ -334,8 +334,6 @@ impl WampClient {
                         eprintln!("[client] pong timeout — reconnecting...");
                         break;
                     }
-
-                    
 
                     Some(outbound) = pub_rx.recv() => {
                         let msg = serde_json::to_string(&outbound).unwrap();
@@ -377,13 +375,14 @@ impl WampClient {
                     }
                 }
             }
+
             self.is_connected.store(false, Ordering::Relaxed);
             attempt += 1;
         }
     }
 
     /// Call a remote function on another service.
-    /// Returns the result value or an error string.
+    /// Returns Ok(Value) on success or Err(Value) if the callee returned an error.
     pub async fn call(
         &self,
         target_prefix: &str,
@@ -391,7 +390,7 @@ impl WampClient {
         function: &str,
         args: Value,
         kwargs: Value,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, Value> {
         let target_channel = format!("{}_{}", target_prefix, target_realm);
         let correlation_id = format!("corr-{}", uuid());
         let reply_to = self.channel.clone();
@@ -429,10 +428,10 @@ impl WampClient {
 
         match tokio::time::timeout(tokio::time::Duration::from_secs(30), rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("reply channel dropped".to_string()),
+            Ok(Err(_)) => Err(serde_json::json!({"error": "reply channel dropped"})),
             Err(_) => {
                 self.pending.lock().await.remove(&correlation_id);
-                Err("call timed out".to_string())
+                Err(serde_json::json!({"error": "call timed out"}))
             }
         }
     }
@@ -454,7 +453,7 @@ impl WampClient {
                 );
                 if let Some(corr_id) = &err.correlation_id {
                     if let Some(tx) = self.pending.lock().await.remove(corr_id) {
-                        let _ = tx.send(Err(err.error.clone()));
+                        let _ = tx.send(Err(serde_json::json!({"error": err.error})));
                     }
                 }
                 return;
@@ -485,10 +484,22 @@ impl WampClient {
                 None => {
                     if let Some(ref cid) = corr_id {
                         if let Some(tx) = self.pending.lock().await.remove(cid) {
-                            let result = event.kwargs
+                            // check is_error flag to decide Ok vs Err
+                            let is_error = event.kwargs
+                                .as_ref()
+                                .and_then(|kw| kw.get("is_error"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+
+                            let payload = event.kwargs
                                 .or(event.args)
                                 .unwrap_or(Value::Null);
-                            let _ = tx.send(Ok(result));
+
+                            if is_error {
+                                let _ = tx.send(Err(payload));
+                            } else {
+                                let _ = tx.send(Ok(payload));
+                            }
                         }
                     } else {
                         println!("[client] ← EVENT {}", text);
@@ -535,13 +546,13 @@ impl WampClient {
                 let result = h(args, kwargs).await;
 
                 if let (Some(corr_id), Some(rt)) = (correlation_id, reply_to) {
-                    let payload = match result {
-                        Ok(v) => v,
-                        Err(e) => serde_json::json!({"error": e}),
+                    let (payload, is_error) = match result {
+                        Ok(v) => (v, false),
+                        Err(e) => (e, true),
                     };
-                    let reply = make_reply(&self.channel, &rt, &corr_id, payload, false);
+                    let reply = make_reply(&self.channel, &rt, &corr_id, payload, is_error);
                     let msg = serde_json::to_string(&reply).unwrap();
-                    println!("[client] → REPLY fn='{}' corr={}", function, corr_id);
+                    println!("[client] → REPLY fn='{}' corr={} is_error={}", function, corr_id, is_error);
                     let _ = ws_stream.send(Message::Text(msg.into())).await;
                 }
             }
@@ -555,7 +566,7 @@ const PING_INTERVAL_SECS: u64 = 15;
 const PING_TIMEOUT_SECS: u64 = 10;
 
 fn make_reply(
-    my_channel: &str,
+    _my_channel: &str,
     reply_to: &str,
     correlation_id: &str,
     payload: Value,
@@ -617,10 +628,10 @@ macro_rules! wamp_args {
         $args
             .as_ref()
             .and_then(|a| a.get(0))
-            .ok_or_else(|| "missing args".to_string())
+            .ok_or_else(|| serde_json::json!({"error": "missing args"}))
             .and_then(|v| {
                 serde_json::from_value(v.clone())
-                    .map_err(|e| format!("invalid args: {}", e))
+                    .map_err(|e| serde_json::json!({"error": format!("invalid args: {}", e)}))
             })
     };
 }
