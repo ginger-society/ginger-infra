@@ -43,6 +43,39 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
         &token_response.sub,
     ));
 
+
+    client.register("install_ssl", |args, _kwargs| async move {
+        let parsed: InstallSslArgs = wamp_args!(args)?;
+
+        println!("[install_ssl] requesting cert for domain={}", parsed.domain);
+
+        let status = tokio::process::Command::new("certbot")
+            .arg("certonly")
+            .arg("--apache")
+            .arg("--non-interactive")
+            .arg("--agree-tos")
+            .arg("--no-eff-email")
+            .arg("--register-unsafely-without-email")
+            .arg("-d")
+            .arg(&parsed.domain)
+            .status()
+            .await
+            .map_err(|e| json!({"error": format!("failed to run certbot: {}", e)}))?;
+
+        if !status.success() {
+            return Err(json!({
+                "error": "certbot failed",
+                "exit_code": status.code(),
+                "domain": parsed.domain,
+            }));
+        }
+
+        Ok(json!({
+            "status": "installed",
+            "domain": parsed.domain,
+        }))
+    }).await;
+
     
     client.register("setup_gateway", |args, _kwargs| async move {
         let parsed: SetupGatewayArgs = wamp_args!(args)?;
