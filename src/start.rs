@@ -33,8 +33,11 @@ struct SetupGatewayArgs {
     #[serde(default)]
     websocket: bool,
 }
- 
 
+#[derive(Deserialize)]
+struct DeleteClusterArgs {
+    name: String,
+}
 
 pub async fn main(access_token: String, token_response: ValidateApiTokenResponse, metadata_config: &MetadataConfiguration, device_id: String) {
     let client = Arc::new(WampClient::new(
@@ -42,6 +45,60 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
         &access_token,
         &token_response.sub,
     ));
+
+
+    client.register("delete_cluster", |args, _kwargs| async move {
+
+        let parsed: DeleteClusterArgs = wamp_args!(args)?;
+        let name = &parsed.name;
+
+        println!("[delete_cluster] deleting cluster '{}'", name);
+
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                r#"curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/ginger-infra-helpers/delete-kind-cluster.sh | bash -s -- {}"#,
+                name
+            ))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| json!({"error": format!("failed to spawn script: {}", e)}))?;
+
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    eprintln!("[delete_cluster] stderr: {}", line);
+                }
+            });
+        }
+
+        let status = child.wait().await
+            .map_err(|e| json!({"error": format!("failed to wait for script: {}", e)}))?;
+
+        if !status.success() {
+            let exit_code = status.code().unwrap_or(-1);
+            let error_msg = match exit_code {
+                2 => format!("cluster '{}' does not exist", name),
+                3 => "kind delete cluster failed".to_string(),
+                4 => "nginx reload failed after removing cluster entry".to_string(),
+                _ => format!("script failed with exit code {}", exit_code),
+            };
+            return Err(json!({
+                "error": error_msg,
+                "exit_code": exit_code,
+            }));
+        }
+
+        println!("[delete_cluster] cluster '{}' deleted successfully", name);
+
+        Ok(json!({
+            "status": "deleted",
+            "cluster": name,
+        }))
+    }).await;
 
 
     client.register("install_ssl", |args, _kwargs| async move {
@@ -54,7 +111,6 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
             .arg("--apache")
             .arg("--non-interactive")
             .arg("--agree-tos")
-            .arg("--no-eff-email")
             .arg("--register-unsafely-without-email")
             .arg("-d")
             .arg(&parsed.domain)
