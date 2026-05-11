@@ -10,7 +10,6 @@ use crate::{wamp_args, wamp_client::WampClient};
 #[derive(Deserialize)]
 struct InstallSslArgs {
     domain: String,
-    email: String,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +26,15 @@ struct CreateClusterArgs {
     port_mappings: Vec<PortMapping>,
 }
 
+#[derive(Deserialize)]
+struct SetupGatewayArgs {
+    domain: String,
+    port: u16,
+    #[serde(default)]
+    websocket: bool,
+}
+ 
+
 
 pub async fn main(access_token: String, token_response: ValidateApiTokenResponse, metadata_config: &MetadataConfiguration, device_id: String) {
     let client = Arc::new(WampClient::new(
@@ -35,36 +43,96 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
         &token_response.sub,
     ));
 
-    client.register("install_ssl", |args, _kwargs| async move {
-        let parsed: InstallSslArgs = wamp_args!(args)?;
 
-        println!("[install_ssl] requesting cert for domain={} email={}", parsed.domain, parsed.email);
 
-        let status = tokio::process::Command::new("certbot")
-            .arg("certonly")
-            .arg("--apache")
-            .arg("--non-interactive")
-            .arg("--agree-tos")
-            .arg("--no-eff-email")
-            .arg("--email")
-            .arg(&parsed.email)
-            .arg("-d")
-            .arg(&parsed.domain)
-            .status()
+    client.register("setup_gateway", |args, _kwargs| async move {
+        let parsed: SetupGatewayArgs = wamp_args!(args)?;
+    
+        println!(
+            "[setup_gateway] domain={} port={} websocket={}",
+            parsed.domain, parsed.port, parsed.websocket
+        );
+    
+        let mut cmd = tokio::process::Command::new("/usr/local/bin/setup-gateway.sh");
+        cmd.arg("--domain").arg(&parsed.domain)
+        .arg("--port").arg(parsed.port.to_string());
+    
+        if parsed.websocket {
+            cmd.arg("--websocket");
+        }
+    
+        let output = cmd
+            .output()
             .await
-            .map_err(|e| json!({"error": format!("failed to run certbot: {}", e)}))?;
-
-        if !status.success() {
+            .map_err(|e| json!({"error": format!("failed to run setup-gateway.sh: {}", e)}))?;
+    
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    
+        if !output.status.success() {
             return Err(json!({
-                "error": "certbot failed",
-                "exit_code": status.code(),
+                "error": "setup-gateway.sh failed",
+                "exit_code": output.status.code(),
                 "domain": parsed.domain,
+                "stdout": stdout,
+                "stderr": stderr,
             }));
         }
-
+    
         Ok(json!({
-            "status": "installed",
+            "status": "configured",
             "domain": parsed.domain,
+            "port": parsed.port,
+            "websocket": parsed.websocket,
+            "stdout": stdout,
+        }))
+    }).await;
+
+    client.register("setup_gateway", |args, _kwargs| async move {
+        let parsed: SetupGatewayArgs = wamp_args!(args)?;
+    
+        println!(
+            "[setup_gateway] domain={} port={} websocket={}",
+            parsed.domain, parsed.port, parsed.websocket
+        );
+    
+        let ws_flag = if parsed.websocket { "--websocket" } else { "" };
+    
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                r#"curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/ginger-infra-helpers/setup-gateway.sh | bash -s -- --domain {} --port {} {}"#,
+                parsed.domain, parsed.port, ws_flag
+            ))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| json!({"error": format!("failed to spawn setup-gateway.sh: {}", e)}))?;
+    
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| json!({"error": format!("failed to wait on setup-gateway.sh: {}", e)}))?;
+    
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    
+        if !output.status.success() {
+            return Err(json!({
+                "error": "setup-gateway.sh failed",
+                "exit_code": output.status.code(),
+                "domain": parsed.domain,
+                "stdout": stdout,
+                "stderr": stderr,
+            }));
+        }
+    
+        Ok(json!({
+            "status": "configured",
+            "domain": parsed.domain,
+            "port": parsed.port,
+            "websocket": parsed.websocket,
+            "stdout": stdout,
         }))
     }).await;
 
@@ -85,34 +153,58 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
         )).map_err(|e| json!({"error": format!("failed to serialize port mappings: {}", e)}))?;
 
         println!("[create_cluster] name={} api_port={}", name, api_port);
+        println!("[create_cluster] port_mappings={}", port_mappings);
 
-        // download and pipe to bash
-        let output = tokio::process::Command::new("bash")
+        let mut child = tokio::process::Command::new("bash")
             .arg("-c")
             .arg(format!(
                 r#"curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/ginger-infra-helpers/create-kind-cluster.sh | bash -s -- {} {} '{}'"#,
                 name, api_port, port_mappings
             ))
-            .output()
-            .await
-            .map_err(|e| json!({"error": format!("failed to run script: {}", e)}))?;
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| json!({"error": format!("failed to spawn script: {}", e)}))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        // stream stderr to logs in real time
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    eprintln!("[create_cluster] stderr: {}", line);
+                }
+            });
+        }
 
-        if !output.status.success() {
-            let exit_code = output.status.code().unwrap_or(-1);
+        // stream stdout to logs and capture it
+        let mut stdout_lines = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            use tokio::io::AsyncBufReadExt;
+            let mut reader = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                println!("[create_cluster] stdout: {}", line);
+                stdout_lines.push(line);
+            }
+        }
+
+        let status = child.wait().await
+            .map_err(|e| json!({"error": format!("failed to wait for script: {}", e)}))?;
+
+        let stdout = stdout_lines.join("\n");
+
+        if !status.success() {
+            let exit_code = status.code().unwrap_or(-1);
             let error_msg = match exit_code {
                 2 => format!("cluster '{}' already exists", name),
                 3 => "kind create cluster failed".to_string(),
                 4 => "nginx reload failed after updating stream config".to_string(),
                 5 => "failed to get kubeconfig".to_string(),
-                _ => format!("script failed: {}", stderr),
+                _ => format!("script failed with exit code {}", exit_code),
             };
             return Err(json!({
                 "error": error_msg,
                 "exit_code": exit_code,
-                "stderr": stderr,
             }));
         }
 

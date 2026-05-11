@@ -543,18 +543,31 @@ impl WampClient {
             }
             Some(h) => {
                 println!("[client] ← CALL fn='{}' corr={:?}", function, correlation_id);
-                let result = h(args, kwargs).await;
+                
+                // spawn handler so it doesn't block the select loop
+                let channel = self.channel.clone();
+                let publish_tx = self.publish_tx.clone();
+                
+                tokio::spawn(async move {
+                    let result = h(args, kwargs).await;
 
-                if let (Some(corr_id), Some(rt)) = (correlation_id, reply_to) {
-                    let (payload, is_error) = match result {
-                        Ok(v) => (v, false),
-                        Err(e) => (e, true),
-                    };
-                    let reply = make_reply(&self.channel, &rt, &corr_id, payload, is_error);
-                    let msg = serde_json::to_string(&reply).unwrap();
-                    println!("[client] → REPLY fn='{}' corr={} is_error={}", function, corr_id, is_error);
-                    let _ = ws_stream.send(Message::Text(msg.into())).await;
-                }
+                    if let (Some(corr_id), Some(rt)) = (correlation_id, reply_to) {
+                        let (payload, is_error) = match result {
+                            Ok(v) => (v, false),
+                            Err(e) => (e, true),
+                        };
+                        let reply = make_reply(&channel, &rt, &corr_id, payload, is_error);
+                        let msg = serde_json::to_string(&reply).unwrap();
+                        println!("[client] → REPLY fn='{}' corr={} is_error={}", function, corr_id, is_error);
+
+                        // send reply via publish channel instead of ws_stream directly
+                        if let Ok(guard) = publish_tx.try_lock() {
+                            if let Some(tx) = guard.as_ref() {
+                                let _ = tx.send(reply).await;
+                            }
+                        }
+                    }
+                });
             }
         }
     }
