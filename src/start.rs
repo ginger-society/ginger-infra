@@ -24,7 +24,17 @@ struct CreateClusterArgs {
     name: String,
     api_port: u16,
     port_mappings: Vec<PortMapping>,
+    #[serde(default = "default_cpus")]
+    cpus: u16,
+    #[serde(default = "default_memory")]
+    memory: String,
+    #[serde(default = "default_disk")]
+    disk: String,
 }
+
+fn default_cpus() -> u16 { 2 }
+fn default_memory() -> String { "4g".to_string() }
+fn default_disk() -> String { "30g".to_string() }
 
 #[derive(Deserialize)]
 struct SetupGatewayArgs {
@@ -38,6 +48,13 @@ struct SetupGatewayArgs {
 struct DeleteClusterArgs {
     name: String,
 }
+
+
+#[derive(Deserialize)]
+struct DeleteGatewayArgs {
+    domain: String,
+}
+
 
 pub async fn main(access_token: String, token_response: ValidateApiTokenResponse, metadata_config: &MetadataConfiguration, device_id: String) {
     let client = Arc::new(WampClient::new(
@@ -106,6 +123,17 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
 
         println!("[install_ssl] requesting cert for domain={}", parsed.domain);
 
+        // Check if cert already exists at /etc/letsencrypt/live/<domain>/privkey.pem
+        let cert_path = format!("/etc/letsencrypt/live/{}/privkey.pem", parsed.domain);
+        if std::path::Path::new(&cert_path).exists() {
+            println!("[install_ssl] cert already exists at {}, skipping certbot", cert_path);
+            return Ok(json!({
+                "status": "already_installed",
+                "domain": parsed.domain,
+                "cert_path": cert_path,
+            }));
+        }
+
         let status = tokio::process::Command::new("certbot")
             .arg("certonly")
             .arg("--apache")
@@ -129,6 +157,50 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
         Ok(json!({
             "status": "installed",
             "domain": parsed.domain,
+        }))
+    }).await;
+
+    client.register("delete_gateway", |args, _kwargs| async move {
+        let parsed: DeleteGatewayArgs = wamp_args!(args)?;
+
+        println!(
+            "[delete_gateway] domain={}",
+            parsed.domain
+        );
+
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                r#"curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/ginger-infra-helpers/delete-gateway.sh | bash -s -- --domain {}"#,
+                parsed.domain
+            ))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| json!({"error": format!("failed to spawn delete-gateway.sh: {}", e)}))?;
+
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| json!({"error": format!("failed to wait on delete-gateway.sh: {}", e)}))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if !output.status.success() {
+            return Err(json!({
+                "error": "delete-gateway.sh failed",
+                "exit_code": output.status.code(),
+                "domain": parsed.domain,
+                "stdout": stdout,
+                "stderr": stderr,
+            }));
+        }
+
+        Ok(json!({
+            "status": "deleted",
+            "domain": parsed.domain,
+            "stdout": stdout,
         }))
     }).await;
 
@@ -197,14 +269,17 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
             .collect::<Vec<_>>()
         )).map_err(|e| json!({"error": format!("failed to serialize port mappings: {}", e)}))?;
 
-        println!("[create_cluster] name={} api_port={}", name, api_port);
+        println!(
+            "[create_cluster] name={} api_port={} cpus={} memory={} disk={}",
+            name, api_port, parsed.cpus, parsed.memory, parsed.disk
+        );
         println!("[create_cluster] port_mappings={}", port_mappings);
 
         let mut child = tokio::process::Command::new("bash")
             .arg("-c")
             .arg(format!(
-                r#"curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/ginger-infra-helpers/create-kind-cluster.sh | bash -s -- {} {} '{}'"#,
-                name, api_port, port_mappings
+                r#"curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/ginger-infra-helpers/create-kind-cluster.sh | bash -s -- {} {} '{}' --cpus {} --memory {} --disk {}"#,
+                name, api_port, port_mappings, parsed.cpus, parsed.memory, parsed.disk
             ))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

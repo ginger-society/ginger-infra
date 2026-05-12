@@ -137,6 +137,9 @@ pub struct WampClient {
     pub is_connected: Arc<AtomicBool>,
 }
 
+pub type SharedWampClient = Arc<WampClient>;
+
+
 impl WampClient {
     /// Create a new client.
     /// `prefix`       — service name e.g. "ginger_infra"
@@ -385,13 +388,11 @@ impl WampClient {
     /// Returns Ok(Value) on success or Err(Value) if the callee returned an error.
     pub async fn call(
         &self,
-        target_prefix: &str,
-        target_realm: &str,
         function: &str,
+        target_channel:String,
         args: Value,
         kwargs: Value,
     ) -> Result<Value, Value> {
-        let target_channel = format!("{}_{}", target_prefix, target_realm);
         let correlation_id = format!("corr-{}", uuid());
         let reply_to = self.channel.clone();
 
@@ -424,7 +425,14 @@ impl WampClient {
             function, correlation_id, publish.topic
         );
 
-        let _ = serde_json::to_string(&publish).unwrap();
+        {
+            let guard = self.publish_tx.lock().await;
+            let tx = guard
+                .as_ref()
+                .ok_or_else(|| serde_json::json!({"error": "not connected — call listen() first"}))?;
+            tx.send(publish).await
+                .map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+        }
 
         match tokio::time::timeout(tokio::time::Duration::from_secs(30), rx).await {
             Ok(Ok(result)) => result,
