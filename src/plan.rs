@@ -464,6 +464,7 @@ fn render_template(
 pub enum PlatformFileType {
     Yaml,          // deployment.yml, service.yml, configmap.yaml ...
     Secrets,       // secrets.yaml
+    Envrc,    
 }
 
 #[derive(Debug)]
@@ -486,6 +487,8 @@ fn discover_platform_files(platform_dir: &Path) -> Vec<PlatformFile> {
 
         let file_type = if file_name == "secrets.yaml" {
             PlatformFileType::Secrets
+        }else if file_name == ".envrc" {         
+            PlatformFileType::Envrc
         } else if file_name.ends_with(".yaml") || file_name.ends_with(".yml") {
             PlatformFileType::Yaml
         } else {
@@ -524,7 +527,10 @@ fn render_to_build(
 
         let template_name = file.relative_path.to_string_lossy().to_string();
 
-        let rendered = if raw.contains("{{") {
+        let rendered = if file.file_type == PlatformFileType::Envrc {
+            // .envrc is never templated — copy verbatim
+            raw
+        } else if raw.contains("{{") {
             render_template(&raw, &template_name, resolved, snapshot)?
         } else {
             raw
@@ -587,9 +593,11 @@ pub fn run_plan() -> anyhow::Result<()> {
 
     let yaml_count    = files.iter().filter(|f| f.file_type == PlatformFileType::Yaml).count();
     let secrets_count = files.iter().filter(|f| f.file_type == PlatformFileType::Secrets).count();
+    let envrc_count   = files.iter().filter(|f| f.file_type == PlatformFileType::Envrc).count();  // ← add
+
 
     println!("\n── Platform files ───────────────────────────────────");
-    println!("  {} yaml/yml  |  {} secrets.yaml", yaml_count, secrets_count);
+    println!("  {} yaml/yml  |  {} secrets.yaml  |  {} .envrc", yaml_count, secrets_count, envrc_count);  // ← update
 
     // 5. render to build/
     println!("\n── Rendering to build/ ──────────────────────────────");
