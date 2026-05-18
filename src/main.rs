@@ -18,6 +18,7 @@ mod wamp_client;
 mod heartbeat;
 mod plan;
 mod run_dry_run;
+mod rollout;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -29,6 +30,8 @@ enum Commands {
     Plan,
     /// Run a dry-run of the plan command
     DryRun,
+    /// Rollout changes
+    Rollout,
     /// installs a portal , creates an entry in the application table in IAM db, this should be run in the FE app repo
     InstallOrUpdatePortal,
     /// deploy by applying in order to a k8 cluster , should take a kubeconfig as an argument , this should also make sure that the DB migrations are run
@@ -73,6 +76,12 @@ async fn check_session_gurad(
                 }
                 Commands::Plan => {
                    if let Err(e) = plan::run_plan() {
+                        eprintln!("plan failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Commands::Rollout => {
+                   if let Err(e) = rollout::run_rollout() {
                         eprintln!("plan failed: {e}");
                         std::process::exit(1);
                     }

@@ -3,18 +3,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// ── .envrc discovery & parsing ───────────────────────────────────────────────
-
-// ── .envrc discovery ──────────────────────────────────────────────────────────
+// ── .envrc discovery & parsing ────────────────────────────────────────────────
 
 /// Walk UP from `start` but STOP at (and never go above) `ceiling`.
-/// This prevents escaping the build/ directory and picking up a system .envrc.
-fn find_envrc_bounded(start: &Path, ceiling: &Path) -> Option<PathBuf> {
+/// Prevents escaping the build/ directory and picking up a system .envrc.
+pub fn find_envrc_bounded(start: &Path, ceiling: &Path) -> Option<PathBuf> {
     let ceiling = ceiling.canonicalize().ok()?;
     let mut dir = start.canonicalize().ok()?;
 
     loop {
-        // Never search above the ceiling
         if !dir.starts_with(&ceiling) {
             return None;
         }
@@ -24,7 +21,6 @@ fn find_envrc_bounded(start: &Path, ceiling: &Path) -> Option<PathBuf> {
             return Some(candidate);
         }
 
-        // Stop exactly at ceiling — don't pop further
         if dir == ceiling {
             return None;
         }
@@ -36,9 +32,8 @@ fn find_envrc_bounded(start: &Path, ceiling: &Path) -> Option<PathBuf> {
 }
 
 /// Parse `export KEY=VALUE` (and bare `KEY=VALUE`) lines from an `.envrc`.
-/// Expands `$HOME` and `${HOME}` using the real process environment so that
-/// paths like `$HOME/Downloads/kubeconfig/artifactory.yml` resolve correctly.
-fn parse_envrc(content: &str) -> HashMap<String, String> {
+/// Expands `$HOME` and `${HOME}` using the real process environment.
+pub fn parse_envrc(content: &str) -> HashMap<String, String> {
     let mut vars: HashMap<String, String> = HashMap::new();
 
     for raw in content.lines() {
@@ -48,27 +43,16 @@ fn parse_envrc(content: &str) -> HashMap<String, String> {
             continue;
         }
 
-        // strip leading `export ` if present
         let line = line.strip_prefix("export ").unwrap_or(line);
 
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_string();
-
-            // strip surrounding quotes
             let value = value.trim();
             let value = value
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .or_else(|| {
-                    value
-                        .strip_prefix('\'')
-                        .and_then(|v| v.strip_suffix('\''))
-                })
+                .strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
                 .unwrap_or(value);
-
-            // expand $HOME / ${HOME} using the real environment
             let value = expand_home(value);
-
             vars.insert(key, value);
         }
     }
@@ -77,14 +61,14 @@ fn parse_envrc(content: &str) -> HashMap<String, String> {
 }
 
 /// Replace `$HOME` and `${HOME}` with the value of the `HOME` env var.
-fn expand_home(s: &str) -> String {
+pub fn expand_home(s: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     s.replace("${HOME}", &home).replace("$HOME", &home)
 }
 
-// ── yaml collection (unchanged) ───────────────────────────────────────────────
+// ── yaml collection ───────────────────────────────────────────────────────────
 
-fn collect_yamls(dir: &Path, out: &mut Vec<PathBuf>) {
+pub fn collect_yamls(dir: &Path, out: &mut Vec<PathBuf>) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
@@ -106,14 +90,11 @@ fn collect_yamls(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Picks up KUBECONFIG (and any other vars) from the nearest `.envrc` walking
 /// up from the current working directory.  Does NOT apply anything.
 pub fn run_dry_run() -> anyhow::Result<()> {
-    // ── 1. locate & load .envrc ───────────────────────────────────────────────
-    let cwd = std::env::current_dir()?;
-
-    // ── 2. run plan to populate build/ ────────────────────────────────────────
+    // ── 1. run plan to populate build/ ────────────────────────────────────────
     println!("\n── Running plan before dry-run ──────────────────────");
     crate::plan::run_plan()?;
 
-    // ── 3. collect yaml files ─────────────────────────────────────────────────
+    // ── 2. collect yaml files ─────────────────────────────────────────────────
     let build_dir = Path::new("build");
     if !build_dir.exists() {
         anyhow::bail!("build/ not found — plan must have failed");
@@ -129,25 +110,23 @@ pub fn run_dry_run() -> anyhow::Result<()> {
 
     println!("\n── kubectl diff ─────────────────────────────────────");
 
-    let mut any_diff = false;
-    let mut any_new = false;
+    let mut any_diff  = false;
+    let mut any_new   = false;
     let mut any_error = false;
-    let mut new_resources: Vec<String> = Vec::new();
+    let mut new_resources:     Vec<String> = Vec::new();
     let mut changed_resources: Vec<String> = Vec::new();
-    let mut error_resources: Vec<String> = Vec::new();
+    let mut error_resources:   Vec<String> = Vec::new();
 
-    // ── 4. diff each file ─────────────────────────────────────────────────────
-
+    // ── 3. diff each file ─────────────────────────────────────────────────────
     let build_dir_canonical = build_dir.canonicalize()?;
 
     for file in &yaml_files {
         let label = file
-        .strip_prefix(build_dir)
-        .unwrap_or(file)
-        .display()
-        .to_string();
+            .strip_prefix(build_dir)
+            .unwrap_or(file)
+            .display()
+            .to_string();
 
-        // Resolve .envrc scoped to this file's directory, bounded by build/
         let file_dir = file.parent().map(Path::to_path_buf)
             .unwrap_or_else(|| build_dir.to_path_buf());
 
@@ -204,9 +183,7 @@ pub fn run_dry_run() -> anyhow::Result<()> {
                     Some(code) => {
                         eprintln!(
                             "  ✗ {} — kubectl error (exit {}): {}",
-                            label,
-                            code,
-                            stderr.trim()
+                            label, code, stderr.trim()
                         );
                         error_resources.push(label);
                         any_error = true;
@@ -220,26 +197,20 @@ pub fn run_dry_run() -> anyhow::Result<()> {
         }
     }
 
-    // ── 5. summary ────────────────────────────────────────────────────────────
+    // ── 4. summary ────────────────────────────────────────────────────────────
     println!("\n── Summary ──────────────────────────────────────────");
 
     if !new_resources.is_empty() {
         println!("  ✦ New ({}):", new_resources.len());
-        for r in &new_resources {
-            println!("      {}", r);
-        }
+        for r in &new_resources { println!("      {}", r); }
     }
     if !changed_resources.is_empty() {
         println!("  ~ Changed ({}):", changed_resources.len());
-        for r in &changed_resources {
-            println!("      {}", r);
-        }
+        for r in &changed_resources { println!("      {}", r); }
     }
     if !error_resources.is_empty() {
         println!("  ✗ Errors ({}):", error_resources.len());
-        for r in &error_resources {
-            println!("      {}", r);
-        }
+        for r in &error_resources { println!("      {}", r); }
     }
     if !any_diff && !any_new && !any_error {
         println!("  ✓ No changes — cluster is already up to date");
