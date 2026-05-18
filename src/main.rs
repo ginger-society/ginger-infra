@@ -16,15 +16,16 @@ mod portalInstaller;
 mod start;
 mod wamp_client;
 mod heartbeat;
+mod plan;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize a infra project
     Init,
-    /// gives the option to select an item from the dev portal and generate its deployment , service and update ingress
-    Add,
+    /// generate/update resources for all the databases in the workspace
+    SyncDBServices,
     // after taking a snapshot using ginger-releaser , we can apply it using this - this might be a stop action , but can be called immediately after the releaser command
-    ApplySnapshot,
+    Plan,
     /// installs a portal , creates an entry in the application table in IAM db, this should be run in the FE app repo
     InstallOrUpdatePortal,
     /// deploy by applying in order to a k8 cluster , should take a kubeconfig as an argument , this should also make sure that the DB migrations are run
@@ -63,13 +64,15 @@ async fn check_session_gurad(
                 Commands::Init => {
                     println!("Hello, world!");
                 }
-                Commands::Add => {
-                    // generate resources from db-compose.toml file
+                Commands::SyncDBServices => {
+                    // generate/update resources for all the databases in the workspace
                     println!("Hello, world!");
                 }
-                Commands::ApplySnapshot => {
-                    // applies a snapshot version in a given environment
-                    println!("Hello, world!");
+                Commands::Plan => {
+                   if let Err(e) = plan::run_plan() {
+                        eprintln!("plan failed: {e}");
+                        std::process::exit(1);
+                    }
                 }
                 Commands::InstallOrUpdatePortal => {
                     install_or_update_portal(config_path, &iam_config, releaser_path, package_path)
