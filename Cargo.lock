@@ -909,6 +909,7 @@ dependencies = [
  "tera",
  "tokio",
  "tokio-tungstenite",
+ "toml",
  "walkdir",
 ]
 

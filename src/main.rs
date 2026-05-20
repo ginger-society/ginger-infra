@@ -19,6 +19,8 @@ mod heartbeat;
 mod plan;
 mod run_dry_run;
 mod rollout;
+mod load_fixtures;
+mod verbose_replace;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -41,6 +43,18 @@ enum Commands {
         /// Unique device identifier
         #[arg(long)]
         device_id: String,
+    },
+    /// Load SQL fixtures into database pods
+    LoadFixtures,
+    /// Replace verbose
+    /// Replace verbose
+    VerboseReplace {
+        /// Input file path
+        #[arg(short, long)]
+        input: String,
+        /// Output file path (optional, defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
     }
 }
 
@@ -80,9 +94,23 @@ async fn check_session_gurad(
                         std::process::exit(1);
                     }
                 }
+                Commands::LoadFixtures => {
+                    if let Err(e) = load_fixtures::run_load_fixtures() {
+                        eprintln!("load-fixtures failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
                 Commands::Rollout => {
                    if let Err(e) = rollout::run_rollout() {
                         eprintln!("plan failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Commands::VerboseReplace { input, output } => {
+                    let input_path = Path::new(&input);
+                    let output_path = output.as_deref().map(Path::new);
+                    if let Err(e) = verbose_replace::run_verbose_replace(input_path, output_path) {
+                        eprintln!("verbose-replace failed: {e}");
                         std::process::exit(1);
                     }
                 }

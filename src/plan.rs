@@ -165,12 +165,37 @@ fn resolve_value(
                 "file({}) could not be read: {}",
                 path_str, e
             ))?;
-        return Ok(ResolvedValue::Concrete(content.trim_end().to_string()));
+        // Don't trim_end() — SSH keys and certs require a trailing newline
+        return Ok(ResolvedValue::Concrete(content));
     }
 
     // vault(...) — deferred, do not resolve now
     if let Some(key) = strip_wrapper(raw, "vault(") {
         return Ok(ResolvedValue::Vault(key.to_string()));
+    }
+
+    // env var interpolation — replace $VAR_NAME or ${VAR_NAME} with env value
+    // applies to plain strings containing $ that don't match other directives
+    let env_re = Regex::new(r"\$\{?([A-Z_][A-Z0-9_]*)\}?").unwrap();
+    if env_re.is_match(raw) {
+        let mut errors: Vec<String> = Vec::new();
+        let result = env_re.replace_all(raw, |caps: &regex::Captures| {
+            let var_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            match std::env::var(var_name) {
+                Ok(val) => val,
+                Err(_) => {
+                    errors.push(var_name.to_string());
+                    caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
+                }
+            }
+        }).to_string();
+        if !errors.is_empty() {
+            anyhow::bail!(
+                "Undefined environment variable(s): {}",
+                errors.join(", ")
+            );
+        }
+        return Ok(ResolvedValue::Concrete(result));
     }
 
     // plain string
@@ -202,7 +227,7 @@ fn run_shell(cmd: &str) -> anyhow::Result<String> {
 
 // ── Values loading and resolution ─────────────────────────────────────────────
 
-/// Flat resolved map: "SECTION.KEY" → ResolvedValue
+/// Flat resolved map: "KEY" or "SECTION.KEY" or "A.B.C.D" → ResolvedValue
 pub type ResolvedValues = std::collections::HashMap<String, ResolvedValue>;
 
 fn collect_keys(value: &serde_json::Value, prefix: &str, keys: &mut HashSet<String>) {
@@ -227,13 +252,14 @@ fn check_unfilled(value: &serde_json::Value, prefix: &str, unfilled: &mut Vec<St
         }
         serde_json::Value::Null => { unfilled.push(prefix.to_string()); }
         serde_json::Value::String(s) => {
-            // CHANGE_ME or empty/whitespace — but not shell/file/vault/onceshell directives
+            // CHANGE_ME or empty/whitespace — but not shell/file/vault/onceshell/$ENV directives
             let t = s.trim();
             if (t.is_empty() || t == "CHANGE_ME")
                 && !t.starts_with("shell(")
                 && !t.starts_with("onceshell(")
                 && !t.starts_with("file(")
                 && !t.starts_with("vault(")
+                && !t.contains('$')
             {
                 unfilled.push(prefix.to_string());
             }
@@ -242,7 +268,47 @@ fn check_unfilled(value: &serde_json::Value, prefix: &str, unfilled: &mut Vec<St
     }
 }
 
-fn load_and_resolve_values(
+/// Recursively walk the values JSON tree, resolving every leaf string.
+/// The flat key is the full dot-joined path e.g. "HOSTING_FQDN", "IAM.URL", "a.b.c".
+fn resolve_recursive(
+    value: &serde_json::Value,
+    prefix: &str,
+    memory: &mut serde_json::Map<String, serde_json::Value>,
+    memory_path: &Path,
+    resolved: &mut ResolvedValues,
+) -> anyhow::Result<()> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}.{}", prefix, k)
+                };
+                resolve_recursive(v, &key, memory, memory_path, resolved)?;
+            }
+        }
+        serde_json::Value::String(s) => {
+            print!("  resolving {}... ", prefix);
+            let resolved_val = resolve_value(s, memory, memory_path)
+                .map_err(|e| anyhow::anyhow!("Failed to resolve {}: {}", prefix, e))?;
+            match &resolved_val {
+                ResolvedValue::Concrete(_) => println!("✓"),
+                ResolvedValue::Vault(k)    => println!("⏳ vault({}) — deferred to deploy", k),
+            }
+            resolved.insert(prefix.to_string(), resolved_val);
+        }
+        other => {
+            // numbers, bools — convert to string as-is
+            print!("  resolving {}... ", prefix);
+            println!("✓");
+            resolved.insert(prefix.to_string(), ResolvedValue::Concrete(other.to_string()));
+        }
+    }
+    Ok(())
+}
+
+pub fn load_and_resolve_values(
     values_path: &Path,
     backup_path: &Path,
     memory_path: &Path,
@@ -323,30 +389,9 @@ fn load_and_resolve_values(
         serde_json::Map::new()
     };
 
-    // resolve all values
+    // resolve all values recursively
     let mut resolved: ResolvedValues = ResolvedValues::new();
-
-    if let serde_json::Value::Object(sections) = &values {
-        for (section, section_val) in sections {
-            if let serde_json::Value::Object(keys) = section_val {
-                for (key, val) in keys {
-                    let flat_key = format!("{}.{}", section, key);
-                    let raw_str = match val {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    print!("  resolving {}... ", flat_key);
-                    let resolved_val = resolve_value(&raw_str, &mut memory, memory_path)
-                        .map_err(|e| anyhow::anyhow!("Failed to resolve {}: {}", flat_key, e))?;
-                    match &resolved_val {
-                        ResolvedValue::Concrete(_) => println!("✓"),
-                        ResolvedValue::Vault(k)    => println!("⏳ vault({}) — deferred to deploy", k),
-                    }
-                    resolved.insert(flat_key, resolved_val);
-                }
-            }
-        }
-    }
+    resolve_recursive(&values, "", &mut memory, memory_path, &mut resolved)?;
 
     // persist final memory
     fs::write(
@@ -359,10 +404,10 @@ fn load_and_resolve_values(
 
 // ── Template rendering ────────────────────────────────────────────────────────
 
-/// Substitute {{SECTION.KEY}} in template content using resolved values.
-/// vault() values are left as-is for deploy to handle.
+/// Substitute {{KEY}} or {{SECTION.KEY}} or {{A.B.C}} in template content
+/// using resolved values. vault() values are left as-is for deploy to handle.
 /// Unknown references are hard errors.
-fn render_template(
+pub fn render_template(
     content: &str,
     template_name: &str,
     resolved: &ResolvedValues,
@@ -370,9 +415,9 @@ fn render_template(
 ) -> anyhow::Result<String> {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
-    // matches {{SECTION.KEY}} or {{SECTION.KEY | b64encode}}
+    // matches {{KEY}}, {{SECTION.KEY}}, {{A.B.C.D}} or any of the above | b64encode
     let ref_re = Regex::new(
-        r"\{\{\s*([A-Za-z0-9_]+\.[A-Za-z0-9_]+)\s*(?:\|\s*(b64encode))?\s*\}\}"
+        r"\{\{\s*([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\s*(?:\|\s*(b64encode))?\s*\}\}"
     ).unwrap();
     let svc_re = Regex::new(r#"\{\{\s*services\["([^"]+)"\]\s*\}\}"#).unwrap();
     let pkg_re = Regex::new(r#"\{\{\s*packages\["([^"]+)"\]\s*\}\}"#).unwrap();
@@ -462,9 +507,9 @@ fn render_template(
 
 #[derive(Debug, PartialEq)]
 pub enum PlatformFileType {
-    Yaml,          // deployment.yml, service.yml, configmap.yaml ...
-    Secrets,       // secrets.yaml
-    Envrc,    
+    Yaml,       // deployment.yml, service.yml, configmap.yaml ...
+    Secrets,    // secrets.yaml
+    Envrc,
 }
 
 #[derive(Debug)]
@@ -487,7 +532,7 @@ fn discover_platform_files(platform_dir: &Path) -> Vec<PlatformFile> {
 
         let file_type = if file_name == "secrets.yaml" {
             PlatformFileType::Secrets
-        }else if file_name == ".envrc" {         
+        } else if file_name == ".envrc" {
             PlatformFileType::Envrc
         } else if file_name.ends_with(".yaml") || file_name.ends_with(".yml") {
             PlatformFileType::Yaml
@@ -593,11 +638,10 @@ pub fn run_plan() -> anyhow::Result<()> {
 
     let yaml_count    = files.iter().filter(|f| f.file_type == PlatformFileType::Yaml).count();
     let secrets_count = files.iter().filter(|f| f.file_type == PlatformFileType::Secrets).count();
-    let envrc_count   = files.iter().filter(|f| f.file_type == PlatformFileType::Envrc).count();  // ← add
-
+    let envrc_count   = files.iter().filter(|f| f.file_type == PlatformFileType::Envrc).count();
 
     println!("\n── Platform files ───────────────────────────────────");
-    println!("  {} yaml/yml  |  {} secrets.yaml  |  {} .envrc", yaml_count, secrets_count, envrc_count);  // ← update
+    println!("  {} yaml/yml  |  {} secrets.yaml  |  {} .envrc", yaml_count, secrets_count, envrc_count);
 
     // 5. render to build/
     println!("\n── Rendering to build/ ──────────────────────────────");
