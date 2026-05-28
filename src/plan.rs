@@ -1,6 +1,6 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -106,26 +106,35 @@ fn validate_snapshot(snapshot: &Snapshot) -> anyhow::Result<()> {
 
 // ── Value resolution ──────────────────────────────────────────────────────────
 
-/// Resolved value — either a concrete string or a vault placeholder
+/// Resolved value — either a concrete string, a vault placeholder, or a
+/// deferred shell command that will be run at render time with the correct
+/// .envrc context for the file being rendered.
 #[derive(Debug, Clone)]
 pub enum ResolvedValue {
     /// A concrete value ready to be substituted into templates
     Concrete(String),
     /// A vault key — substitution deferred to deploy time
     Vault(String),
+    /// A shell command — deferred to render time so the correct .envrc
+    /// (e.g. mcs/.envrc with KUBECONFIG) is applied when it runs
+    Shell(String),
 }
 
 impl ResolvedValue {
     pub fn as_template_str(&self) -> String {
         match self {
             ResolvedValue::Concrete(v) => v.clone(),
-            // vault placeholders stay as-is for deploy to handle
-            ResolvedValue::Vault(key) => format!("vault({})", key),
+            ResolvedValue::Vault(key)  => format!("vault({})", key),
+            // Shell values should have been resolved before template rendering;
+            // if one slips through, surface it clearly rather than silently
+            // emitting an empty string.
+            ResolvedValue::Shell(cmd)  => format!("shell({})", cmd),
         }
     }
 }
 
-/// Parse a value string and resolve it to a ResolvedValue
+/// Parse a value string and resolve it to a ResolvedValue.
+/// shell() is NOT executed here — it is deferred to render time.
 fn resolve_value(
     raw: &str,
     memory: &mut serde_json::Map<String, serde_json::Value>,
@@ -133,13 +142,15 @@ fn resolve_value(
 ) -> anyhow::Result<ResolvedValue> {
     let raw = raw.trim();
 
-    // shell(...) — run every time
+    // shell(...) — deferred to render time so the correct .envrc context
+    // (KUBECONFIG etc.) is applied per platform file directory
     if let Some(cmd) = strip_wrapper(raw, "shell(") {
-        let result = run_shell(cmd)?;
-        return Ok(ResolvedValue::Concrete(result));
+        return Ok(ResolvedValue::Shell(cmd.to_string()));
     }
 
-    // onceshell(...) — run once, cache in values.memory.json
+    // onceshell(...) — run once eagerly, cache in values.memory.json.
+    // These should not depend on per-directory cluster context; if they do,
+    // use shell(...) instead.
     if let Some(cmd) = strip_wrapper(raw, "onceshell(") {
         let cache_key = format!("onceshell:{}", cmd);
         if let Some(cached) = memory.get(&cache_key).and_then(|v| v.as_str()) {
@@ -175,7 +186,6 @@ fn resolve_value(
     }
 
     // env var interpolation — replace $VAR_NAME or ${VAR_NAME} with env value
-    // applies to plain strings containing $ that don't match other directives
     let env_re = Regex::new(r"\$\{?([A-Z_][A-Z0-9_]*)\}?").unwrap();
     if env_re.is_match(raw) {
         let mut errors: Vec<String> = Vec::new();
@@ -210,6 +220,7 @@ fn strip_wrapper<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+/// Run a shell command with no extra env, used only by onceshell().
 fn run_shell(cmd: &str) -> anyhow::Result<String> {
     let output = Command::new("sh")
         .arg("-c")
@@ -225,10 +236,62 @@ fn run_shell(cmd: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Run a shell command with a specific set of env vars injected.
+/// Used at render time when we know the file's .envrc context.
+fn run_shell_with_env(cmd: &str, env_vars: &HashMap<String, String>) -> anyhow::Result<String> {
+    let kubeconfig = env_vars
+        .get("KUBECONFIG")
+        .cloned()
+        .or_else(|| std::env::var("KUBECONFIG").ok())
+        .unwrap_or_else(|| "(not set)".to_string());
+    println!("    [shell] KUBECONFIG={}", kubeconfig);
+    println!("    [shell] cmd: {}", &cmd[..cmd.len().min(60)]);
+
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(cmd);
+    for (k, v) in env_vars {
+        command.env(k, v);
+    }
+
+    let output = command
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn shell: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("shell command failed:\n  cmd: {}\n  err: {}", cmd, stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// For a given file's env context, resolve any Shell values into Concrete ones.
+/// All other value types are passed through unchanged.
+pub fn resolve_shell_values(
+    resolved: &ResolvedValues,
+    env_vars: &HashMap<String, String>,
+) -> anyhow::Result<ResolvedValues> {
+    let mut out = ResolvedValues::new();
+    for (key, val) in resolved {
+        let concrete = match val {
+            ResolvedValue::Shell(cmd) => {
+                print!("  resolving shell {}... ", key);
+                let result = run_shell_with_env(cmd, env_vars)
+                    .map_err(|e| anyhow::anyhow!("Failed to resolve shell({}) for key {}: {}", cmd, key, e))?;
+                println!("✓");
+                ResolvedValue::Concrete(result)
+            }
+            other => other.clone(),
+        };
+        out.insert(key.clone(), concrete);
+    }
+    Ok(out)
+}
+
 // ── Values loading and resolution ─────────────────────────────────────────────
 
 /// Flat resolved map: "KEY" or "SECTION.KEY" or "A.B.C.D" → ResolvedValue
-pub type ResolvedValues = std::collections::HashMap<String, ResolvedValue>;
+pub type ResolvedValues = HashMap<String, ResolvedValue>;
 
 fn collect_keys(value: &serde_json::Value, prefix: &str, keys: &mut HashSet<String>) {
     match value {
@@ -252,7 +315,6 @@ fn check_unfilled(value: &serde_json::Value, prefix: &str, unfilled: &mut Vec<St
         }
         serde_json::Value::Null => { unfilled.push(prefix.to_string()); }
         serde_json::Value::String(s) => {
-            // CHANGE_ME or empty/whitespace — but not shell/file/vault/onceshell/$ENV directives
             let t = s.trim();
             if (t.is_empty() || t == "CHANGE_ME")
                 && !t.starts_with("shell(")
@@ -269,7 +331,6 @@ fn check_unfilled(value: &serde_json::Value, prefix: &str, unfilled: &mut Vec<St
 }
 
 /// Recursively walk the values JSON tree, resolving every leaf string.
-/// The flat key is the full dot-joined path e.g. "HOSTING_FQDN", "IAM.URL", "a.b.c".
 fn resolve_recursive(
     value: &serde_json::Value,
     prefix: &str,
@@ -295,6 +356,7 @@ fn resolve_recursive(
             match &resolved_val {
                 ResolvedValue::Concrete(_) => println!("✓"),
                 ResolvedValue::Vault(k)    => println!("⏳ vault({}) — deferred to deploy", k),
+                ResolvedValue::Shell(cmd)  => println!("⏳ shell({}) — deferred to render", &cmd[..cmd.len().min(40)]),
             }
             resolved.insert(prefix.to_string(), resolved_val);
         }
@@ -313,12 +375,10 @@ pub fn load_and_resolve_values(
     backup_path: &Path,
     memory_path: &Path,
 ) -> anyhow::Result<ResolvedValues> {
-    // guard
     if values_path == backup_path {
         anyhow::bail!("values.json and values.json.backup cannot be the same file.");
     }
 
-    // load backup
     if !backup_path.exists() {
         anyhow::bail!(
             "values.json.backup not found — must be committed to git.\n\
@@ -328,7 +388,6 @@ pub fn load_and_resolve_values(
     let backup: serde_json::Value = serde_json::from_str(&fs::read_to_string(backup_path)?)
         .map_err(|e| anyhow::anyhow!("Failed to parse values.json.backup: {e}"))?;
 
-    // load values.json
     if !values_path.exists() {
         anyhow::bail!(
             "values.json not found.\n\
@@ -389,7 +448,7 @@ pub fn load_and_resolve_values(
         serde_json::Map::new()
     };
 
-    // resolve all values recursively
+    // resolve all values recursively — shell() stays deferred
     let mut resolved: ResolvedValues = ResolvedValues::new();
     resolve_recursive(&values, "", &mut memory, memory_path, &mut resolved)?;
 
@@ -404,9 +463,10 @@ pub fn load_and_resolve_values(
 
 // ── Template rendering ────────────────────────────────────────────────────────
 
-/// Substitute {{KEY}} or {{SECTION.KEY}} or {{A.B.C}} in template content
-/// using resolved values. vault() values are left as-is for deploy to handle.
-/// Unknown references are hard errors.
+/// Substitute {{KEY}} or {{SECTION.KEY}} or {{A.B.C}} in template content.
+/// By the time this is called, all Shell values must already be resolved to
+/// Concrete via resolve_shell_values() — if any Shell slips through,
+/// as_template_str() will emit shell(...) visibly rather than silently empty.
 pub fn render_template(
     content: &str,
     template_name: &str,
@@ -415,7 +475,6 @@ pub fn render_template(
 ) -> anyhow::Result<String> {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
-    // matches {{KEY}}, {{SECTION.KEY}}, {{A.B.C.D}} or any of the above | b64encode
     let ref_re = Regex::new(
         r"\{\{\s*([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\s*(?:\|\s*(b64encode))?\s*\}\}"
     ).unwrap();
@@ -507,8 +566,8 @@ pub fn render_template(
 
 #[derive(Debug, PartialEq)]
 pub enum PlatformFileType {
-    Yaml,       // deployment.yml, service.yml, configmap.yaml ...
-    Secrets,    // secrets.yaml
+    Yaml,
+    Secrets,
     Envrc,
 }
 
@@ -553,13 +612,21 @@ fn discover_platform_files(platform_dir: &Path) -> Vec<PlatformFile> {
 
 fn render_to_build(
     files: &[PlatformFile],
+    platform_dir: &Path,
     build_dir: &Path,
     resolved: &ResolvedValues,
     snapshot: &Snapshot,
 ) -> anyhow::Result<()> {
+    use crate::run_dry_run::{find_envrc_bounded, parse_envrc};
+
     if build_dir.exists() {
         fs::remove_dir_all(build_dir)?;
     }
+
+    // We walk up from each file's directory bounded by platform/ to find the
+    // nearest .envrc. This means platform/mcs/secrets.yaml picks up
+    // platform/mcs/.envrc (with its KUBECONFIG), not the root one.
+    let platform_dir_canonical = platform_dir.canonicalize()?;
 
     for file in files {
         let dest = build_dir.join(&file.relative_path);
@@ -576,7 +643,38 @@ fn render_to_build(
             // .envrc is never templated — copy verbatim
             raw
         } else if raw.contains("{{") {
-            render_template(&raw, &template_name, resolved, snapshot)?
+            // Find the nearest .envrc walking up from this file's directory,
+            // bounded by platform/. This gives us the correct KUBECONFIG for
+            // any shell() commands that reference cluster secrets.
+            let file_dir = file.absolute_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| platform_dir.to_path_buf());
+
+            let env_vars = match find_envrc_bounded(&file_dir, &platform_dir_canonical) {
+                Some(envrc_path) => {
+                    println!(
+                        "  .envrc context for {}: {}",
+                        file.relative_path.display(),
+                        envrc_path.display()
+                    );
+                    let content = fs::read_to_string(&envrc_path).map_err(|e| {
+                        anyhow::anyhow!("Cannot read '{}': {e}", envrc_path.display())
+                    })?;
+                    parse_envrc(&content)
+                }
+                None => {
+                    // No .envrc found in platform/ — fall back to process env.
+                    // shell() commands will inherit whatever KUBECONFIG is set
+                    // in the environment that launched ginger-infra.
+                    HashMap::new()
+                }
+            };
+
+            // Resolve shell() values now that we have the correct env context
+            let contextual_resolved = resolve_shell_values(resolved, &env_vars)?;
+
+            render_template(&raw, &template_name, &contextual_resolved, snapshot)?
         } else {
             raw
         };
@@ -612,6 +710,8 @@ pub fn run_plan() -> anyhow::Result<()> {
     validate_snapshot(&snapshot)?;
 
     // 3. load + resolve values
+    // Note: shell() values are NOT executed here — they are deferred to
+    // render time (step 5) where we know which .envrc context applies.
     println!("\n── Resolving values ─────────────────────────────────");
     let resolved = load_and_resolve_values(
         Path::new("values.json"),
@@ -621,9 +721,10 @@ pub fn run_plan() -> anyhow::Result<()> {
 
     let concrete_count = resolved.values().filter(|v| matches!(v, ResolvedValue::Concrete(_))).count();
     let vault_count    = resolved.values().filter(|v| matches!(v, ResolvedValue::Vault(_))).count();
+    let shell_count    = resolved.values().filter(|v| matches!(v, ResolvedValue::Shell(_))).count();
     println!(
-        "\n✓ Values resolved: {} concrete, {} vault (deferred to deploy)",
-        concrete_count, vault_count
+        "\n✓ Values resolved: {} concrete, {} vault (deferred to deploy), {} shell (deferred to render)",
+        concrete_count, vault_count, shell_count
     );
 
     // 4. discover platform files
@@ -644,8 +745,11 @@ pub fn run_plan() -> anyhow::Result<()> {
     println!("  {} yaml/yml  |  {} secrets.yaml  |  {} .envrc", yaml_count, secrets_count, envrc_count);
 
     // 5. render to build/
+    // shell() values are resolved here, scoped to each file's nearest .envrc
+    // within platform/ — so platform/mcs/**  picks up platform/mcs/.envrc
+    // and gets the correct KUBECONFIG for that cluster.
     println!("\n── Rendering to build/ ──────────────────────────────");
-    render_to_build(&files, Path::new("build"), &resolved, &snapshot)?;
+    render_to_build(&files, platform_dir, Path::new("build"), &resolved, &snapshot)?;
 
     println!("\n✓ Rendered {} files → build/", files.len());
     if vault_count > 0 {

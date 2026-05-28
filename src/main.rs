@@ -78,8 +78,7 @@ async fn check_session_gurad(
     releaser_path: &Path,
     token: String,
 ) {
-    match identity_validate_api_token(&iam_config).await {
-        Ok(response) => {
+    
             match cli.command {
                 Commands::Init => {
                     println!("Hello, world!");
@@ -126,16 +125,22 @@ async fn check_session_gurad(
                 }
                 Commands::Deploy => todo!(),
                 Commands::Start {device_id}=> {
-                    start::main(token.clone(), response, &metadata_config, device_id).await;
-                },
+
+                    match identity_validate_api_token(&iam_config).await {
+                            Ok(response) => {
+
+                                start::main(token.clone(), response, &metadata_config, device_id).await;
+                            }
+                            Err(error) => {
+                                println!("Token validation failed: {:?}", error);
+                                std::process::exit(1);
+                            }
+                   
+                }
             }
 
             // println!("Token is valid: {:?}", response)
-        }
-        Err(error) => {
-            println!("Token validation failed: {:?}", error);
-            std::process::exit(1);
-        }
+       
     }
 }
 
