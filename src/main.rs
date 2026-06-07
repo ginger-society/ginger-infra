@@ -21,6 +21,7 @@ mod run_dry_run;
 mod rollout;
 mod load_fixtures;
 mod verbose_replace;
+mod install_helm_charts;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -55,7 +56,8 @@ enum Commands {
         /// Output file path (optional, defaults to stdout)
         #[arg(short, long)]
         output: Option<String>,
-    }
+    },
+    InstallHelmCharts
 }
 
 #[derive(Parser, Debug)]
@@ -127,21 +129,24 @@ async fn check_session_gurad(
                 Commands::Start {device_id}=> {
 
                     match identity_validate_api_token(&iam_config).await {
-                            Ok(response) => {
+                        Ok(response) => {
 
-                                start::main(token.clone(), response, &metadata_config, device_id).await;
-                            }
-                            Err(error) => {
-                                println!("Token validation failed: {:?}", error);
-                                std::process::exit(1);
-                            }
-                   
+                            start::main(token.clone(), response, &metadata_config, device_id).await;
+                        }
+                        Err(error) => {
+                            println!("Token validation failed: {:?}", error);
+                            std::process::exit(1);
+                        }
+                    }
+                
                 }
+                Commands::InstallHelmCharts => {
+                    if let Err(e) = install_helm_charts::run_install_helm_charts() {
+                        eprintln!("install-helm-charts failed: {e}");
+                        std::process::exit(1);
+                    }
+                },
             }
-
-            // println!("Token is valid: {:?}", response)
-       
-    }
 }
 
 #[main]
