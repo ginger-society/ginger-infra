@@ -340,7 +340,6 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
         Ok(json!({
             "status": "created",
             "cluster": name,
-            "fqdn": format!("{}.test-clusters.rackmint.com", name),
             "api_port": parsed.api_port,
             "port_mappings": parsed.port_mappings.iter().map(|p| json!({
                 "container_port": p.container_port,
