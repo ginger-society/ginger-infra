@@ -117,46 +117,103 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
         }))
     }).await;
 
+    #[cfg(not(unix))]
+    client.register("install_ssl", |_args, _kwargs| async move {
+        Err(json!({"error": "install_ssl is not supported on this platform"}))
+    }).await;
 
+    #[cfg(unix)]
     client.register("install_ssl", |args, _kwargs| async move {
-        let parsed: InstallSslArgs = wamp_args!(args)?;
+        let mut parsed: InstallSslArgs = wamp_args!(args)?;
+        parsed.domain = parsed.domain.trim().to_string();
 
         println!("[install_ssl] requesting cert for domain={}", parsed.domain);
 
-        // Check if cert already exists at /etc/letsencrypt/live/<domain>/privkey.pem
-        let cert_path = format!("/etc/letsencrypt/live/{}/privkey.pem", parsed.domain);
-        if std::path::Path::new(&cert_path).exists() {
-            println!("[install_ssl] cert already exists at {}, skipping certbot", cert_path);
+        // Server sends base_domain directly (e.g. "feat-19.ginger-society.test-clusters.rackmint.com")
+        // No stripping needed — use as-is
+        let base_domain = parsed.domain.clone();
+
+        let wildcard_cert_path = format!("/etc/letsencrypt/live/{}/privkey.pem", base_domain);
+
+        // Fast path — cert already exists, no lock needed
+        if std::path::Path::new(&wildcard_cert_path).exists() {
+            println!("[install_ssl] wildcard cert already exists at {}, skipping certbot", wildcard_cert_path);
             return Ok(json!({
                 "status": "already_installed",
                 "domain": parsed.domain,
-                "cert_path": cert_path,
+                "base_domain": base_domain,
+                "cert_path": wildcard_cert_path,
             }));
         }
 
-        let status = tokio::process::Command::new("certbot")
+        // ── Serialize concurrent certbot calls with a file lock ───────────────
+        let lock_path = "/tmp/certbot.lock";
+        let lock_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(lock_path)
+            .await
+            .map_err(|e| json!({"error": format!("failed to open lock file: {}", e)}))?;
+
+        use std::os::unix::io::IntoRawFd;
+        let fd = lock_file.into_std().await.into_raw_fd();
+        unsafe { libc::flock(fd, libc::LOCK_EX); }
+
+        // Re-check after acquiring lock — a concurrent call may have installed it
+        if std::path::Path::new(&wildcard_cert_path).exists() {
+            unsafe { libc::flock(fd, libc::LOCK_UN); }
+            println!("[install_ssl] wildcard cert installed by concurrent call, skipping");
+            return Ok(json!({
+                "status": "already_installed",
+                "domain": parsed.domain,
+                "base_domain": base_domain,
+                "cert_path": wildcard_cert_path,
+            }));
+        }
+
+        println!("[install_ssl] issuing wildcard cert for base_domain={}", base_domain);
+
+        let output = tokio::process::Command::new("certbot")
             .arg("certonly")
-            .arg("--apache")
+            .arg("--authenticator").arg("dns-godaddy")
+            .arg("--dns-godaddy-credentials").arg("/etc/letsencrypt/godaddy.ini")
             .arg("--non-interactive")
             .arg("--agree-tos")
             .arg("--register-unsafely-without-email")
-            .arg("-d")
-            .arg(&parsed.domain)
-            .status()
+            .arg("-d").arg(&base_domain)
+            .arg("-d").arg(format!("*.{}", base_domain))
+            .output()
             .await
-            .map_err(|e| json!({"error": format!("failed to run certbot: {}", e)}))?;
+            .map_err(|e| {
+                unsafe { libc::flock(fd, libc::LOCK_UN); }
+                json!({"error": format!("failed to run certbot: {}", e)})
+            })?;
 
-        if !status.success() {
+        unsafe { libc::flock(fd, libc::LOCK_UN); }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        println!("[install_ssl] certbot stdout:\n{}", stdout);
+        println!("[install_ssl] certbot stderr:\n{}", stderr);
+
+        if !output.status.success() {
             return Err(json!({
                 "error": "certbot failed",
-                "exit_code": status.code(),
+                "exit_code": output.status.code(),
                 "domain": parsed.domain,
+                "base_domain": base_domain,
+                "stdout": stdout,
+                "stderr": stderr,
             }));
         }
 
         Ok(json!({
             "status": "installed",
             "domain": parsed.domain,
+            "base_domain": base_domain,
+            "cert_path": wildcard_cert_path,
+            "stdout": stdout,
         }))
     }).await;
 
