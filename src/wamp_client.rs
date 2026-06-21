@@ -171,6 +171,10 @@ impl WampClient {
         self.is_connected.load(Ordering::Relaxed)
     }
 
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
+
     /// Register an RPC handler for a function name.
     /// The handler receives (args, kwargs) and returns a JSON result or JSON error.
     pub async fn register<F, Fut>(&self, function: &str, handler: F)

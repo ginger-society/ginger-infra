@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "GingerPresence"
+version = "0.5.0-nightly.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "url",
+]
+
+[[package]]
 name = "IAMService"
 version = "0.5.2-nightly.0"
 dependencies = [
@@ -894,6 +905,7 @@ checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
 name = "ginger-infra"
 version = "0.6.0-nightly.0"
 dependencies = [
+ "GingerPresence",
  "IAMService",
  "MetadataService",
  "anyhow",

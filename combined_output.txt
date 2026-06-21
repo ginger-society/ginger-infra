@@ -1,0 +1,3866 @@
+=== heartbeat.rs ===
+
+use sysinfo::{Components, Disks, Networks, System};
+use serde_json::{json, Value};
+
+pub fn collect_stats() -> Value {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    // ── CPU ──────────────────────────────────────────────────────────────────
+    let global_cpu = sys.global_cpu_info().cpu_usage();
+    let per_core: Vec<Value> = sys
+        .cpus()
+        .iter()
+        .enumerate()
+        .map(|(i, cpu)| {
+            json!({
+                "core": i,
+                "usage_pct": (cpu.cpu_usage() * 10.0).round() / 10.0,
+                "frequency_mhz": cpu.frequency(),
+            })
+        })
+        .collect();
+
+    // ── Memory ───────────────────────────────────────────────────────────────
+    let total_mem  = sys.total_memory();   // bytes
+    let used_mem   = sys.used_memory();
+    let total_swap = sys.total_swap();
+    let used_swap  = sys.used_swap();
+
+    // ── Disk ─────────────────────────────────────────────────────────────────
+    let disks = Disks::new_with_refreshed_list();
+    let storage: Vec<Value> = disks
+        .iter()
+        .map(|d| {
+            json!({
+                "mount":        d.mount_point().to_string_lossy(),
+                "total_mb":     mb(d.total_space()),
+                "available_mb": mb(d.available_space()),
+                "used_pct":     usage_pct(d.total_space(), d.available_space()),
+                "fs":           d.file_system().to_string_lossy(),
+            })
+        })
+        .collect();
+
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "cpu": {
+            "global_usage_pct": (global_cpu * 10.0).round() / 10.0,
+            "cores": per_core,
+        },
+        "memory": {
+            "total_mb":     mb(total_mem),
+            "used_mb":      mb(used_mem),
+            "free_mb":      mb(total_mem.saturating_sub(used_mem)),
+            "used_pct":     usage_pct(total_mem, total_mem.saturating_sub(used_mem)),
+            "swap_total_mb": mb(total_swap),
+            "swap_used_mb":  mb(used_swap),
+        },
+        "storage": storage,
+    })
+}
+
+fn mb(bytes: u64) -> f64 {
+    (bytes as f64 / 1_048_576.0 * 10.0).round() / 10.0
+}
+
+fn usage_pct(total: u64, available: u64) -> f64 {
+    if total == 0 { return 0.0; }
+    let used = total.saturating_sub(available);
+    ((used as f64 / total as f64) * 1000.0).round() / 10.0
+}
+
+=== install_helm_charts.rs ===
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::Deserialize;
+
+use crate::plan::{
+    load_and_resolve_values, resolve_shell_values, ResolvedValue, ResolvedValues, Snapshot,
+};
+use crate::run_dry_run::{find_envrc_bounded, parse_envrc};
+
+// ── Resource types ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Resource {
+    LocalChart(LocalChart),
+    RemoteChart(RemoteChart),
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalChart {
+    release: String,
+    /// Path to the chart directory, relative to the resources.toml file
+    chart: String,
+    #[serde(default)]
+    set: HashMap<String, String>,
+    #[serde(default = "default_timeout")]
+    timeout: String,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteChart {
+    release: String,
+    repo_name: String,
+    repo_url: String,
+    /// "<repo_name>/<chart_name>" e.g. "bitnami/postgresql"
+    chart: String,
+    /// Optional values file, relative to the resources.toml file
+    values_file: Option<String>,
+    #[serde(default)]
+    set: HashMap<String, String>,
+    #[serde(default = "default_timeout")]
+    timeout: String,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+fn default_timeout() -> String {
+    "5m".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct ResourcesFile {
+    resource: Vec<Resource>,
+}
+
+// ── Discovery ─────────────────────────────────────────────────────────────────
+
+/// Find all resources.toml files directly under platform/<cluster>/ directories.
+fn discover_resources_files(platform_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+
+    let entries = match fs::read_dir(platform_dir) {
+        Ok(e) => e,
+        Err(_) => return found,
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            let candidate = path.join("resources.toml");
+            if candidate.is_file() {
+                found.push(candidate);
+            }
+        }
+    }
+
+    found.sort();
+    found
+}
+
+// ── Template substitution for --set values ────────────────────────────────────
+
+/// Substitute {{KEY}} placeholders in a single string using resolved values.
+/// This mirrors render_template() but for a single value string rather than
+/// a full file.
+///
+/// - Concrete  → substituted immediately
+/// - Vault     → emitted as `vault(KEY)` literal, substituted at install time
+/// - Shell     → should already be Concrete by this point (resolve_shell_values
+///               runs before this); error if one slips through
+/// - Missing   → error
+fn substitute_set_value(raw: &str, resolved: &ResolvedValues, key_hint: &str) -> anyhow::Result<String> {
+    use regex::Regex;
+    let re = Regex::new(r"\{\{\s*([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\s*\}\}").unwrap();
+
+    let mut errors: Vec<String> = Vec::new();
+
+    let result = re.replace_all(raw, |caps: &regex::Captures| {
+        let k = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        match resolved.get(k) {
+            Some(ResolvedValue::Concrete(v)) => v.clone(),
+            Some(ResolvedValue::Vault(vault_key)) => {
+                // pass through as vault(KEY) — substituted in-memory at install time
+                format!("vault({})", vault_key)
+            }
+            Some(ResolvedValue::Shell(_)) => {
+                // should have been resolved by resolve_shell_values() before this call
+                errors.push(format!(
+                    "'{{{{{}}}}}' still has an unresolved shell() value in set.{} — this is a bug",
+                    k, key_hint
+                ));
+                String::new()
+            }
+            None => {
+                errors.push(format!("'{{{{{}}}}}' not found in values.json (used in set.{})", k, key_hint));
+                String::new()
+            }
+        }
+    }).to_string();
+
+    if !errors.is_empty() {
+        anyhow::bail!("{}", errors.join("\n"));
+    }
+
+    Ok(result)
+}
+
+// ── Vault substitution (mirrors rollout.rs) ───────────────────────────────────
+
+fn substitute_vault_str(raw: &str, vault: &HashMap<String, String>, hint: &str) -> anyhow::Result<String> {
+    use regex::Regex;
+    let re = Regex::new(r"vault\(([^)]+)\)").unwrap();
+    let mut errors: Vec<String> = Vec::new();
+
+    let result = re.replace_all(raw, |caps: &regex::Captures| {
+        let key = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        match vault.get(key) {
+            Some(v) => v.clone(),
+            None => {
+                errors.push(format!("vault key '{}' not found in vault.json (in {})", key, hint));
+                format!("vault({})", key)
+            }
+        }
+    }).to_string();
+
+    if !errors.is_empty() {
+        anyhow::bail!("{}", errors.join("\n"));
+    }
+
+    Ok(result)
+}
+
+// ── helm repo add (idempotent, warnings suppressed) ───────────────────────────
+
+fn helm_repo_add(repo_name: &str, repo_url: &str, env_vars: &HashMap<String, String>) -> anyhow::Result<()> {
+    let output = Command::new("helm")
+        .args(["repo", "add", repo_name, repo_url])
+        .envs(env_vars)
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to run helm repo add: {}", e))?;
+
+    // exit 1 with "already exists" is fine — idempotent
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("already exists") {
+            // silently ignore
+            return Ok(());
+        }
+        anyhow::bail!(
+            "helm repo add '{}' failed (exit {:?}): {}",
+            repo_name,
+            output.status.code(),
+            stderr.trim()
+        );
+    }
+
+    println!("  ✓ helm repo '{}' added", repo_name);
+    Ok(())
+}
+
+fn helm_repo_update(env_vars: &HashMap<String, String>) -> anyhow::Result<()> {
+    let output = Command::new("helm")
+        .args(["repo", "update"])
+        .envs(env_vars)
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to run helm repo update: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("helm repo update failed: {}", stderr.trim());
+    }
+
+    println!("  ✓ helm repo update complete");
+    Ok(())
+}
+
+// ── helm upgrade --install ────────────────────────────────────────────────────
+
+fn helm_upgrade_install(
+    release: &str,
+    chart: &str,
+    set_values: &HashMap<String, String>,    // already fully resolved
+    values_file: Option<&str>,
+    namespace: Option<&str>,
+    timeout: &str,
+    env_vars: &HashMap<String, String>,
+    label: &str,
+) -> anyhow::Result<()> {
+    let mut cmd = Command::new("helm");
+    cmd.args(["upgrade", "--install", release, chart]);
+    cmd.args(["--wait", "--timeout", timeout]);
+
+    if let Some(ns) = namespace {
+        cmd.args(["--namespace", ns, "--create-namespace"]);
+    }
+
+    if let Some(vf) = values_file {
+        cmd.args(["-f", vf]);
+    }
+
+    // pass --set values in sorted order for determinism
+    let mut set_pairs: Vec<_> = set_values.iter().collect();
+    set_pairs.sort_by_key(|(k, _)| k.as_str());
+    for (k, v) in &set_pairs {
+        cmd.args(["--set", &format!("{}={}", k, v)]);
+    }
+
+    cmd.envs(env_vars);
+
+    println!("  ⚙ helm upgrade --install {} {} (--wait --timeout {})", release, chart, timeout);
+    for (k, v) in &set_pairs {
+        // mask anything that looks like a password
+        let display = if k.to_lowercase().contains("password") || k.to_lowercase().contains("secret") {
+            "***".to_string()
+        } else {
+            v.to_string()
+        };
+        println!("      --set {}={}", k, display);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn helm: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() {
+        for line in stdout.lines() {
+            println!("    {}", line);
+        }
+        println!("  ✓ {} installed/upgraded successfully", label);
+        Ok(())
+    } else {
+        eprintln!("  ✗ {} — helm failed (exit {:?})", label, output.status.code());
+        for line in stderr.lines() {
+            eprintln!("    {}", line);
+        }
+        anyhow::bail!("helm upgrade --install failed for '{}'", release);
+    }
+}
+
+// ── Plan step: render resources.toml → helm-build/ ───────────────────────────
+
+/// Render all resources.toml files found under platform/ into helm-build/,
+/// resolving shell() values with the correct .envrc context.
+/// vault() placeholders remain as-is for the install step.
+pub fn plan_helm_charts() -> anyhow::Result<()> {
+    let platform_dir = Path::new("platform");
+    if !platform_dir.exists() {
+        anyhow::bail!("platform/ directory not found");
+    }
+
+    let resources_files = discover_resources_files(platform_dir);
+
+    if resources_files.is_empty() {
+        println!("No resources.toml files found under platform/");
+        return Ok(());
+    }
+
+    // load + resolve values (shell() deferred, vault() deferred)
+    println!("── Resolving values ─────────────────────────────────");
+    let resolved = load_and_resolve_values(
+        Path::new("values.json"),
+        Path::new("values.json.backup"),
+        Path::new("values.memory.json"),
+    )?;
+
+    // load snapshot (needed by load_and_resolve_values' render path)
+    let snapshot_path = Path::new("snapshot.json");
+    if !snapshot_path.exists() {
+        anyhow::bail!("snapshot.json not found");
+    }
+    let snapshot: Snapshot = serde_json::from_str(&fs::read_to_string(snapshot_path)?)
+        .map_err(|e| anyhow::anyhow!("Failed to parse snapshot.json: {e}"))?;
+
+    let helm_build_dir = Path::new("helm-build");
+    if helm_build_dir.exists() {
+        fs::remove_dir_all(helm_build_dir)?;
+    }
+    fs::create_dir_all(helm_build_dir)?;
+
+    let platform_canonical = platform_dir.canonicalize()?;
+
+    println!("\n── Rendering helm-build/ ────────────────────────────");
+
+    for resources_path in &resources_files {
+        let cluster_dir = resources_path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| platform_dir.to_path_buf());
+
+        let cluster_label = cluster_dir
+            .strip_prefix(platform_dir)
+            .unwrap_or(&cluster_dir)
+            .display()
+            .to_string();
+
+        // resolve .envrc for shell() context
+        let env_vars = match find_envrc_bounded(&cluster_dir, &platform_canonical) {
+            Some(envrc_path) => {
+                let content = fs::read_to_string(&envrc_path)
+                    .map_err(|e| anyhow::anyhow!("Cannot read .envrc: {}", e))?;
+                parse_envrc(&content)
+            }
+            None => HashMap::new(),
+        };
+
+        // resolve shell() values with this cluster's env context
+        let contextual_resolved = resolve_shell_values(&resolved, &env_vars)?;
+
+        // parse and validate the resources.toml
+        let toml_content = fs::read_to_string(resources_path)
+            .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", resources_path.display(), e))?;
+
+        let resources_file: ResourcesFile = toml::from_str(&toml_content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", resources_path.display(), e))?;
+
+        // render each resource's set values — vault() stays as-is, shell()/{{}} resolved
+        let rendered = render_resources_toml(&resources_file, &contextual_resolved, &cluster_label)?;
+
+        // write to helm-build/<cluster>/resources.toml
+        let dest_dir = helm_build_dir.join(&cluster_label);
+        fs::create_dir_all(&dest_dir)?;
+        let dest = dest_dir.join("resources.toml");
+        fs::write(&dest, rendered)
+            .map_err(|e| anyhow::anyhow!("Cannot write {}: {}", dest.display(), e))?;
+
+        println!("  → helm-build/{}/resources.toml", cluster_label);
+
+        // copy .envrc verbatim so find_envrc_bounded works in helm-build/ at install time,
+        // exactly as plan.rs does for build/ — without this the install step falls back to
+        // inherited environment and loses KUBECONFIG
+        match find_envrc_bounded(&cluster_dir, &platform_canonical) {
+            Some(envrc_path) => {
+                let envrc_dest = dest_dir.join(".envrc");
+                fs::copy(&envrc_path, &envrc_dest).map_err(|e| anyhow::anyhow!(
+                    "Cannot copy .envrc '{}' → '{}': {}",
+                    envrc_path.display(), envrc_dest.display(), e
+                ))?;
+                println!("  → helm-build/{}/.envrc", cluster_label);
+            }
+            None => {
+                println!("  ⚠ No .envrc found for {} — KUBECONFIG must be in environment at install time", cluster_label);
+            }
+        }
+
+        // also copy any values files referenced by remote charts, resolving their paths
+        copy_referenced_values_files(&resources_file, &cluster_dir, &dest_dir)?;
+    }
+
+    println!("\n✓ helm-build/ ready");
+    Ok(())
+}
+
+/// Render a ResourcesFile back to TOML string with {{KEY}} substituted in set values.
+/// vault() placeholders in set values are left as-is for the install step.
+fn render_resources_toml(
+    file: &ResourcesFile,
+    resolved: &ResolvedValues,
+    cluster_label: &str,
+) -> anyhow::Result<String> {
+    // We re-serialize to TOML manually rather than depending on serde round-trip,
+    // so we can apply substitution only to set values while leaving everything else
+    // exactly as written.
+    let mut out = String::new();
+
+    for resource in &file.resource {
+        match resource {
+            Resource::LocalChart(r) => {
+                out.push_str("[[resource]]\n");
+                out.push_str("type = \"local_chart\"\n");
+                out.push_str(&format!("release = {:?}\n", r.release));
+                out.push_str(&format!("chart = {:?}\n", r.chart));
+                out.push_str(&format!("timeout = {:?}\n", r.timeout));
+                if let Some(ns) = &r.namespace {
+                    out.push_str(&format!("namespace = {:?}\n", ns));
+                }
+                for (k, v) in &r.set {
+                    let rendered = substitute_set_value(v, resolved, k)
+                        .map_err(|e| anyhow::anyhow!("[{}] local_chart '{}': {}", cluster_label, r.release, e))?;
+                    out.push_str(&format!("set.{} = {:?}\n", quote_key(k), rendered));
+                }
+                out.push('\n');
+            }
+            Resource::RemoteChart(r) => {
+                out.push_str("[[resource]]\n");
+                out.push_str("type = \"remote_chart\"\n");
+                out.push_str(&format!("release = {:?}\n", r.release));
+                out.push_str(&format!("repo_name = {:?}\n", r.repo_name));
+                out.push_str(&format!("repo_url = {:?}\n", r.repo_url));
+                out.push_str(&format!("chart = {:?}\n", r.chart));
+                out.push_str(&format!("timeout = {:?}\n", r.timeout));
+                if let Some(ns) = &r.namespace {
+                    out.push_str(&format!("namespace = {:?}\n", ns));
+                }
+                if let Some(vf) = &r.values_file {
+                    // path will be rewritten to be relative to helm-build/<cluster>/
+                    out.push_str(&format!("values_file = {:?}\n", Path::new(vf).file_name().unwrap_or_default().to_string_lossy().as_ref()));
+                }
+                for (k, v) in &r.set {
+                    let rendered = substitute_set_value(v, resolved, k)
+                        .map_err(|e| anyhow::anyhow!("[{}] remote_chart '{}': {}", cluster_label, r.release, e))?;
+                    out.push_str(&format!("set.{} = {:?}\n", quote_key(k), rendered));
+                }
+                out.push('\n');
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Keys like "rabbitmq.auth.username" need quoting in TOML inline table keys.
+fn quote_key(k: &str) -> String {
+    if k.contains('.') || k.contains('-') {
+        format!("\"{}\"", k)
+    } else {
+        k.to_string()
+    }
+}
+
+/// Copy values files referenced by remote charts into the helm-build cluster dir.
+fn copy_referenced_values_files(
+    file: &ResourcesFile,
+    source_dir: &Path,
+    dest_dir: &Path,
+) -> anyhow::Result<()> {
+    for resource in &file.resource {
+        if let Resource::RemoteChart(r) = resource {
+            if let Some(vf) = &r.values_file {
+                let src = source_dir.join(vf);
+                let file_name = Path::new(vf).file_name()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid values_file path: {}", vf))?;
+                let dst = dest_dir.join(file_name);
+
+                fs::copy(&src, &dst).map_err(|e| anyhow::anyhow!(
+                    "Cannot copy values file '{}' → '{}': {}",
+                    src.display(), dst.display(), e
+                ))?;
+                println!("  → helm-build/{}", dst.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Install step: read helm-build/, vault-substitute, run helm ────────────────
+
+pub fn run_install_helm_charts() -> anyhow::Result<()> {
+    // ── 1. plan step ─────────────────────────────────────────────────────────
+    println!("── Planning helm charts ─────────────────────────────");
+    plan_helm_charts()?;
+
+    // ── 2. load vault.json ────────────────────────────────────────────────────
+    let vault_path = Path::new("vault.json");
+    let vault: HashMap<String, String> = if vault_path.exists() {
+        let raw = fs::read_to_string(vault_path)?;
+        serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("Failed to parse vault.json: {e}"))?
+    } else {
+        println!("  ⚠ vault.json not found — vault() values will fail if referenced");
+        HashMap::new()
+    };
+
+    // ── 3. collect rendered resources files ───────────────────────────────────
+    let helm_build_dir = Path::new("helm-build");
+    if !helm_build_dir.exists() {
+        anyhow::bail!("helm-build/ not found — plan step must have failed");
+    }
+
+    let mut resources_files: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(helm_build_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let p = entry.path().join("resources.toml");
+            if p.is_file() {
+                resources_files.push(p);
+            }
+        }
+    }
+    resources_files.sort();
+
+    if resources_files.is_empty() {
+        println!("No resources.toml files in helm-build/ — nothing to install");
+        return Ok(());
+    }
+
+    println!("\n── Installing helm charts ───────────────────────────");
+
+    let helm_build_canonical = helm_build_dir.canonicalize()?;
+    let mut installed: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+
+    // ── 4. process each cluster ───────────────────────────────────────────────
+    for resources_path in &resources_files {
+        let cluster_dir = resources_path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| helm_build_dir.to_path_buf());
+
+        let cluster_label = cluster_dir
+            .strip_prefix(helm_build_dir)
+            .unwrap_or(&cluster_dir)
+            .display()
+            .to_string();
+
+        println!("\n── {} ──────────────────────────────────────────", cluster_label);
+
+        // resolve .envrc for KUBECONFIG (walk up from helm-build/<cluster>/ bounded by helm-build/)
+        let env_vars = match find_envrc_bounded(&cluster_dir, &helm_build_canonical) {
+            Some(envrc_path) => {
+                let content = fs::read_to_string(&envrc_path)
+                    .map_err(|e| anyhow::anyhow!("Cannot read .envrc: {}", e))?;
+                let vars = parse_envrc(&content);
+                println!("  ✓ .envrc loaded from {}", envrc_path.display());
+                vars
+            }
+            None => {
+                println!("  ⚠ No .envrc found — using inherited environment");
+                HashMap::new()
+            }
+        };
+
+        // parse rendered resources.toml
+        let toml_content = fs::read_to_string(resources_path)
+            .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", resources_path.display(), e))?;
+
+        let resources_file: ResourcesFile = toml::from_str(&toml_content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", resources_path.display(), e))?;
+
+        // collect remote repos to add
+        let mut repos_to_add: Vec<(&str, &str)> = Vec::new();
+        let mut seen_repos: HashSet<&str> = HashSet::new();
+        for resource in &resources_file.resource {
+            if let Resource::RemoteChart(r) = resource {
+                if seen_repos.insert(r.repo_name.as_str()) {
+                    repos_to_add.push((&r.repo_name, &r.repo_url));
+                }
+            }
+        }
+
+        // add repos + update once
+        if !repos_to_add.is_empty() {
+            for (name, url) in &repos_to_add {
+                if let Err(e) = helm_repo_add(name, url, &env_vars) {
+                    // fatal — bail immediately
+                    anyhow::bail!("[{}] helm repo add failed: {}", cluster_label, e);
+                }
+            }
+            helm_repo_update(&env_vars)
+                .map_err(|e| anyhow::anyhow!("[{}] {}", cluster_label, e))?;
+        }
+
+        // ── 5. install each resource ──────────────────────────────────────────
+        for resource in &resources_file.resource {
+            match resource {
+                Resource::LocalChart(r) => {
+                    let label = format!("{}/{}", cluster_label, r.release);
+
+                    // resolve vault() in set values
+                    let mut resolved_set: HashMap<String, String> = HashMap::new();
+                    let mut vault_err = false;
+                    for (k, v) in &r.set {
+                        match substitute_vault_str(v, &vault, &label) {
+                            Ok(s) => { resolved_set.insert(k.clone(), s); }
+                            Err(e) => {
+                                eprintln!("  ✗ {}: {}", label, e);
+                                vault_err = true;
+                            }
+                        }
+                    }
+                    if vault_err {
+                        anyhow::bail!("vault substitution failed for '{}'", label);
+                    }
+
+                    // chart path is relative to resources.toml in helm-build/<cluster>/
+                    // but the original path was relative to platform/<cluster>/
+                    // We stored it as-is and resolve relative to platform/ at install time
+                    let chart_path = Path::new("platform")
+                        .join(&cluster_label)
+                        .join(&r.chart);
+                    let chart_str = chart_path.to_string_lossy().to_string();
+
+                    match helm_upgrade_install(
+                        &r.release,
+                        &chart_str,
+                        &resolved_set,
+                        None,
+                        r.namespace.as_deref(),
+                        &r.timeout,
+                        &env_vars,
+                        &label,
+                    ) {
+                        Ok(()) => installed.push(label),
+                        Err(e) => anyhow::bail!("{}", e),   // fatal
+                    }
+                }
+
+                Resource::RemoteChart(r) => {
+                    let label = format!("{}/{}", cluster_label, r.release);
+
+                    // resolve vault() in set values
+                    let mut resolved_set: HashMap<String, String> = HashMap::new();
+                    let mut vault_err = false;
+                    for (k, v) in &r.set {
+                        match substitute_vault_str(v, &vault, &label) {
+                            Ok(s) => { resolved_set.insert(k.clone(), s); }
+                            Err(e) => {
+                                eprintln!("  ✗ {}: {}", label, e);
+                                vault_err = true;
+                            }
+                        }
+                    }
+                    if vault_err {
+                        anyhow::bail!("vault substitution failed for '{}'", label);
+                    }
+
+                    // values_file path is relative to helm-build/<cluster>/
+                    let values_file = r.values_file.as_ref().map(|vf| {
+                        cluster_dir.join(Path::new(vf).file_name().unwrap_or_default())
+                            .to_string_lossy()
+                            .to_string()
+                    });
+
+                    match helm_upgrade_install(
+                        &r.release,
+                        &r.chart,
+                        &resolved_set,
+                        values_file.as_deref(),
+                        r.namespace.as_deref(),
+                        &r.timeout,
+                        &env_vars,
+                        &label,
+                    ) {
+                        Ok(()) => installed.push(label),
+                        Err(e) => anyhow::bail!("{}", e),   // fatal
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 6. summary ────────────────────────────────────────────────────────────
+    println!("\n── Summary ──────────────────────────────────────────");
+
+    if !installed.is_empty() {
+        println!("  ✓ Installed ({}):", installed.len());
+        for r in &installed { println!("      {}", r); }
+    }
+    if failed.is_empty() {
+        println!("\n  ✓ All helm charts installed and ready.");
+    }
+
+    println!();
+    Ok(())
+}
+
+=== load_fixtures.rs ===
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde::Deserialize;
+use walkdir::WalkDir;
+
+use crate::run_dry_run::{find_envrc_bounded, parse_envrc};
+
+// ── Fixture types ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct Fixture {
+    sql_file: String,
+    db_name: String,
+
+    #[serde(default = "default_secret_name")]
+    secret_name: String,
+
+    #[serde(default = "default_pod_name")]
+    pod_name: String,
+
+    #[serde(default = "default_password_key")]
+    password_key: String,
+
+    #[serde(default = "default_username")]
+    username: String,
+
+    #[serde(default = "default_port")]
+    port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixturesFile {
+    fixture: Vec<Fixture>,
+}
+
+fn default_secret_name() -> String { "pg-postgresql".to_string() }
+fn default_pod_name()    -> String { "pg-postgresql-0".to_string() }
+fn default_password_key() -> String { "postgres-password".to_string() }
+fn default_username()    -> String { "postgres".to_string() }
+fn default_port()        -> u16    { 5432 }
+
+// ── Discovery ─────────────────────────────────────────────────────────────────
+
+/// Find all fixtures.toml files directly under platform/<cluster>/ directories.
+/// Only searches one level deep — platform/mcs/fixtures.toml,
+/// platform/artifactory/fixtures.toml, etc.
+fn discover_fixture_files(platform_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+
+    let entries = match fs::read_dir(platform_dir) {
+        Ok(e) => e,
+        Err(_) => return found,
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            let candidate = path.join("fixtures.toml");
+            if candidate.is_file() {
+                found.push(candidate);
+            }
+        }
+    }
+
+    found.sort();
+    found
+}
+
+// ── Secret fetching ───────────────────────────────────────────────────────────
+
+/// Fetch a base64-encoded value from a Kubernetes secret and decode it in Rust.
+/// Never shells out to `base64 -d`.
+fn fetch_secret_value(
+    secret_name: &str,
+    key: &str,
+    env_vars: &HashMap<String, String>,
+) -> anyhow::Result<String> {
+    let jsonpath = format!("{{.data.{}}}", key);
+
+    let mut cmd = Command::new("kubectl");
+    cmd.args(["get", "secret", secret_name, "-o", &format!("jsonpath={}", jsonpath)]);
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
+
+    let output = cmd.output()
+        .map_err(|e| anyhow::anyhow!("Failed to run kubectl get secret: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "kubectl get secret '{}' failed (exit {:?}): {}",
+            secret_name,
+            output.status.code(),
+            stderr.trim()
+        );
+    }
+
+    let b64 = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if b64.is_empty() {
+        anyhow::bail!(
+            "Secret '{}' has no key '{}' or value is empty",
+            secret_name, key
+        );
+    }
+
+    let decoded = BASE64.decode(b64.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to base64-decode secret value: {}", e))?;
+
+    Ok(String::from_utf8_lossy(&decoded).trim().to_string())
+}
+
+// ── kubectl exec + stdin ──────────────────────────────────────────────────────
+
+/// Stream SQL content into `kubectl exec -i <pod> -- psql ...` via stdin.
+/// PGPASSWORD is passed as an env var on the psql process inside the pod —
+/// never appears in process args where `ps aux` could expose it.
+fn kubectl_exec_psql(
+    pod_name: &str,
+    username: &str,
+    password: &str,
+    db_name: &str,
+    port: u16,
+    sql_content: &str,
+    env_vars: &HashMap<String, String>,
+    label: &str,
+) -> anyhow::Result<bool> {
+    let psql_cmd = format!(
+        "env PGPASSWORD={} psql -U {} -d {} -p {}",
+        password, username, db_name, port
+    );
+
+    let mut cmd = Command::new("kubectl");
+    cmd.args([
+        "exec", "-i", pod_name,
+        "--",
+        "sh", "-c", &psql_cmd,
+    ]);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
+
+    let mut child = cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn kubectl exec: {}", e))?;
+
+    if let Some(stdin) = child.stdin.take() {
+        let mut stdin = stdin;
+        stdin.write_all(sql_content.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Failed to write SQL to kubectl stdin: {}", e))?;
+        // stdin closes here, signalling EOF to psql
+    }
+
+    let output = child.wait_with_output()
+        .map_err(|e| anyhow::anyhow!("kubectl exec did not exit cleanly: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() {
+        for line in stdout.lines() {
+            println!("    {}", line);
+        }
+        Ok(true)
+    } else {
+        eprintln!(
+            "  ✗ {} — psql failed (exit {:?})",
+            label, output.status.code()
+        );
+        for line in stderr.lines() {
+            eprintln!("    {}", line);
+        }
+        Ok(false)
+    }
+}
+
+// ── Public entry point ────────────────────────────────────────────────────────
+fn kubectl_recreate_db(
+    pod_name: &str,
+    username: &str,
+    password: &str,
+    db_name: &str,
+    port: u16,
+    env_vars: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let recreate_cmd = format!(
+        "env PGPASSWORD={pw} psql -U {user} -p {port} -d postgres -c \
+        \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db}' AND pid <> pg_backend_pid();\" && \
+        env PGPASSWORD={pw} dropdb -U {user} -p {port} --if-exists {db} && \
+        env PGPASSWORD={pw} createdb -U {user} -p {port} {db}",
+        pw = password,
+        user = username,
+        port = port,
+        db = db_name,
+    );
+
+    let mut cmd = Command::new("kubectl");
+    cmd.args(["exec", "-i", pod_name, "--", "sh", "-c", &recreate_cmd]);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
+
+    let output = cmd.output()
+        .map_err(|e| anyhow::anyhow!("Failed to run recreate db: {}", e))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        anyhow::bail!("recreate db failed (exit {:?}): {}", output.status.code(), stderr.trim());
+    }
+
+    println!("  ✓ database '{}' dropped and recreated", db_name);
+    Ok(())
+}
+
+pub fn run_load_fixtures() -> anyhow::Result<()> {
+    let platform_dir = Path::new("platform");
+    if !platform_dir.exists() {
+        anyhow::bail!("platform/ directory not found");
+    }
+
+    // ── 1. discover all fixtures.toml files ───────────────────────────────────
+    let fixture_files = discover_fixture_files(platform_dir);
+
+    if fixture_files.is_empty() {
+        println!("No fixtures.toml files found under platform/");
+        return Ok(());
+    }
+
+    println!("── Load Fixtures ────────────────────────────────────");
+    println!("  Found {} fixtures.toml file(s)", fixture_files.len());
+
+    let platform_canonical = platform_dir.canonicalize()?;
+
+    let mut loaded:  Vec<String> = Vec::new();
+    let mut failed:  Vec<String> = Vec::new();
+
+    // ── 2. process each fixtures.toml ─────────────────────────────────────────
+    for fixtures_path in &fixture_files {
+        let cluster_dir = fixtures_path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| platform_dir.to_path_buf());
+
+        let cluster_label = cluster_dir
+            .strip_prefix(platform_dir)
+            .unwrap_or(&cluster_dir)
+            .display()
+            .to_string();
+
+        println!("\n── {} ──────────────────────────────────────────", cluster_label);
+
+        // resolve .envrc for this cluster directory, bounded by platform/
+        let env_vars = match find_envrc_bounded(&cluster_dir, &platform_canonical) {
+            Some(envrc_path) => {
+                let content = fs::read_to_string(&envrc_path)
+                    .map_err(|e| anyhow::anyhow!("Cannot read .envrc: {}", e))?;
+                let vars = parse_envrc(&content);
+                println!("  ✓ .envrc loaded from {}", envrc_path.display());
+                vars
+            }
+            None => {
+                println!("  ⚠ No .envrc found — using inherited environment");
+                HashMap::new()
+            }
+        };
+
+        // parse fixtures.toml
+        let toml_content = fs::read_to_string(fixtures_path)
+            .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", fixtures_path.display(), e))?;
+
+        let fixtures_file: FixturesFile = toml::from_str(&toml_content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", fixtures_path.display(), e))?;
+
+        if fixtures_file.fixture.is_empty() {
+            println!("  ⚠ No fixtures defined, skipping");
+            continue;
+        }
+
+        // ── 3. process each fixture entry ─────────────────────────────────────
+        for fixture in &fixtures_file.fixture {
+            // sql_file is relative to the fixtures.toml location
+            let sql_path = cluster_dir.join(&fixture.sql_file);
+            let label = format!("{}/{} → {}", cluster_label, fixture.sql_file, fixture.db_name);
+
+            println!("\n  loading {} ...", label);
+
+            // read SQL file
+            let sql_content = match fs::read_to_string(&sql_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  ✗ Cannot read SQL file '{}': {}", sql_path.display(), e);
+                    failed.push(label);
+                    continue;
+                }
+            };
+
+            // fetch password from secret — decoded in Rust, never in shell args
+            let password = match fetch_secret_value(
+                &fixture.secret_name,
+                &fixture.password_key,
+                &env_vars,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("  ✗ {}: {}", label, e);
+                    failed.push(label);
+                    continue;
+                }
+            };
+
+            // drop, recreate, then load
+            println!("  recreating database '{}' ...", fixture.db_name);
+            if let Err(e) = kubectl_recreate_db(
+                &fixture.pod_name,
+                &fixture.username,
+                &password,
+                &fixture.db_name,
+                fixture.port,
+                &env_vars,
+            ) {
+                eprintln!("  ✗ {}: {}", label, e);
+                failed.push(label);
+                continue;
+            }
+            println!("  ✓ database '{}' ready", fixture.db_name);
+
+            // stream SQL into pod via stdin
+            match kubectl_exec_psql(
+                &fixture.pod_name,
+                &fixture.username,
+                &password,
+                &fixture.db_name,
+                fixture.port,
+                &sql_content,
+                &env_vars,
+                &label,
+            ) {
+                Ok(true) => {
+                    println!("  ✓ {}", label);
+                    loaded.push(label);
+                }
+                Ok(false) => {
+                    failed.push(label);
+                }
+                Err(e) => {
+                    eprintln!("  ✗ {} — {}", label, e);
+                    failed.push(label);
+                }
+            }
+        }
+    }
+
+    // ── 4. summary ────────────────────────────────────────────────────────────
+    println!("\n── Summary ──────────────────────────────────────────");
+
+    if !loaded.is_empty() {
+        println!("  ✓ Loaded ({}):", loaded.len());
+        for r in &loaded { println!("      {}", r); }
+    }
+    if !failed.is_empty() {
+        println!("  ✗ Failed ({}):", failed.len());
+        for r in &failed { println!("      {}", r); }
+    }
+    if loaded.is_empty() && failed.is_empty() {
+        println!("  nothing to load");
+    }
+
+    println!();
+
+    if !failed.is_empty() {
+        anyhow::bail!("load-fixtures completed with {} error(s)", failed.len());
+    }
+
+    Ok(())
+}
+
+=== main.rs ===
+
+use std::path::Path;
+
+use clap::{Parser, Subcommand};
+use ginger_shared_rs::utils::get_token_from_file_storage;
+use portalInstaller::install_or_update_portal;
+use IAMService::apis::{
+    configuration::Configuration as IAMConfiguration, default_api::identity_validate_api_token,
+};
+use IAMService::get_configuration as get_iam_configuration;
+use MetadataService::{
+    apis::configuration::Configuration as MetadataConfiguration,
+    get_configuration as get_metadata_configuration,
+};
+use tokio::main;
+mod portalInstaller;
+mod start;
+mod wamp_client;
+mod heartbeat;
+mod plan;
+mod run_dry_run;
+mod rollout;
+mod load_fixtures;
+mod verbose_replace;
+mod install_helm_charts;
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Initialize a infra project
+    Init,
+    /// generate/update resources for all the databases in the workspace
+    SyncDBServices,
+    // after taking a snapshot using ginger-releaser , we can apply it using this - this might be a stop action , but can be called immediately after the releaser command
+    Plan,
+    /// Run a dry-run of the plan command
+    DryRun,
+    /// Rollout changes
+    Rollout,
+    /// installs a portal , creates an entry in the application table in IAM db, this should be run in the FE app repo
+    InstallOrUpdatePortal,
+    /// deploy by applying in order to a k8 cluster , should take a kubeconfig as an argument , this should also make sure that the DB migrations are run
+    Deploy,
+    /// Start in daemon mode
+    Start {
+        /// Unique device identifier
+        #[arg(long)]
+        device_id: String,
+    },
+    /// Load SQL fixtures into database pods
+    LoadFixtures,
+    /// Replace verbose
+    /// Replace verbose
+    VerboseReplace {
+        /// Input file path
+        #[arg(short, long)]
+        input: String,
+        /// Output file path (optional, defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    InstallHelmCharts
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "ginger-infra")]
+#[command(about = "A tool which wraps various commands from kubectl and helm , used for managing environments", long_about = None)]
+#[command(version, long_about = None)]
+struct Args {
+    /// name of the command to run
+    #[command(subcommand)]
+    command: Commands,
+}
+
+
+async fn check_session_gurad(
+    cli: Args,
+    config_path: &Path,
+    iam_config: &IAMConfiguration,
+    metadata_config: &MetadataConfiguration,
+    package_path: &Path,
+    releaser_path: &Path,
+    token: String,
+) {
+    
+            match cli.command {
+                Commands::Init => {
+                    println!("Hello, world!");
+                }
+                Commands::SyncDBServices => {
+                    // generate/update resources for all the databases in the workspace
+                    println!("Hello, world!");
+                }
+                Commands::Plan => {
+                   if let Err(e) = plan::run_plan() {
+                        eprintln!("plan failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Commands::LoadFixtures => {
+                    if let Err(e) = load_fixtures::run_load_fixtures() {
+                        eprintln!("load-fixtures failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Commands::Rollout => {
+                   if let Err(e) = rollout::run_rollout() {
+                        eprintln!("plan failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Commands::VerboseReplace { input, output } => {
+                    let input_path = Path::new(&input);
+                    let output_path = output.as_deref().map(Path::new);
+                    if let Err(e) = verbose_replace::run_verbose_replace(input_path, output_path) {
+                        eprintln!("verbose-replace failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Commands::DryRun => {
+                   if let Err(e) = run_dry_run::run_dry_run() {
+                        eprintln!("dry run failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Commands::InstallOrUpdatePortal => {
+                    install_or_update_portal(config_path, &iam_config, releaser_path, package_path)
+                        .await
+                }
+                Commands::Deploy => todo!(),
+                Commands::Start {device_id}=> {
+
+                    match identity_validate_api_token(&iam_config).await {
+                        Ok(response) => {
+
+                            start::main(token.clone(), response, &metadata_config, device_id).await;
+                        }
+                        Err(error) => {
+                            println!("Token validation failed: {:?}", error);
+                            std::process::exit(1);
+                        }
+                    }
+                
+                }
+                Commands::InstallHelmCharts => {
+                    if let Err(e) = install_helm_charts::run_install_helm_charts() {
+                        eprintln!("install-helm-charts failed: {e}");
+                        std::process::exit(1);
+                    }
+                },
+            }
+}
+
+#[main]
+async fn main() {
+    let args = Args::parse();
+    let token = get_token_from_file_storage();
+    let metadata_config: MetadataConfiguration = get_metadata_configuration(Some(token.clone()));
+    let iam_config: IAMConfiguration = get_iam_configuration(Some(token.clone()));
+    let service_config_path = Path::new("services.toml");
+    let package_path = Path::new("metadata.toml");
+    let releaser_path = Path::new("releaser.toml");
+
+    
+
+    check_session_gurad(
+        args,
+        service_config_path,
+        &iam_config,
+        &metadata_config,
+        package_path,
+        releaser_path,
+        token,
+    ).await;
+}
+
+
+=== plan.rs ===
+
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use walkdir::WalkDir;
+
+// ── Snapshot types ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct SnapshotService {
+    pub identifier: String,
+    pub version: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct SnapshotPackage {
+    pub identifier: String,
+    pub version: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct SnapshotDatabase {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Snapshot {
+    pub services: Vec<SnapshotService>,
+    pub packages: Vec<SnapshotPackage>,
+    pub databases: Vec<SnapshotDatabase>,
+}
+
+// ── .gitignore check ──────────────────────────────────────────────────────────
+
+fn check_gitignore() -> anyhow::Result<()> {
+    let gitignore = fs::read_to_string(".gitignore").unwrap_or_default();
+    let mut missing: Vec<&str> = Vec::new();
+
+    if !gitignore.lines().any(|l| l.trim() == "values.json" || l.trim() == "/values.json") {
+        missing.push("values.json");
+    }
+    if !gitignore.lines().any(|l| l.trim() == "values.memory.json" || l.trim() == "/values.memory.json") {
+        missing.push("values.memory.json");
+    }
+    if !gitignore.lines().any(|l| l.trim() == "build/" || l.trim() == "/build/") {
+        missing.push("build/");
+    }
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "The following entries are missing from .gitignore:\n{}\n\
+             Add them before running plan.",
+            missing.iter().map(|e| format!("  - {}", e)).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    println!("✓ .gitignore verified");
+    Ok(())
+}
+
+// ── Snapshot validation ───────────────────────────────────────────────────────
+
+fn validate_snapshot(snapshot: &Snapshot) -> anyhow::Result<()> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut seen_services: HashSet<String> = HashSet::new();
+    let mut seen_packages: HashSet<String> = HashSet::new();
+    let mut seen_databases: HashSet<String> = HashSet::new();
+
+    for s in &snapshot.services {
+        if s.version.trim().is_empty() {
+            errors.push(format!("service '{}' has an empty version", s.identifier));
+        }
+        if !seen_services.insert(s.identifier.clone()) {
+            errors.push(format!("service '{}' is duplicated in snapshot.json", s.identifier));
+        }
+    }
+    for p in &snapshot.packages {
+        if p.version.trim().is_empty() {
+            errors.push(format!("package '{}' has an empty version", p.identifier));
+        }
+        if !seen_packages.insert(p.identifier.clone()) {
+            errors.push(format!("package '{}' is duplicated in snapshot.json", p.identifier));
+        }
+    }
+    for d in &snapshot.databases {
+        if d.version.trim().is_empty() {
+            errors.push(format!("database '{}' has an empty version", d.name));
+        }
+        if !seen_databases.insert(d.name.clone()) {
+            errors.push(format!("database '{}' is duplicated in snapshot.json", d.name));
+        }
+    }
+
+    if !errors.is_empty() {
+        eprintln!("\n✗ snapshot.json validation errors:");
+        for e in &errors { eprintln!("    - {}", e); }
+        anyhow::bail!("Fix snapshot.json errors before running plan.");
+    }
+
+    println!("✓ snapshot.json validated");
+    Ok(())
+}
+
+// ── Value resolution ──────────────────────────────────────────────────────────
+
+/// Resolved value — either a concrete string, a vault placeholder, or a
+/// deferred shell command that will be run at render time with the correct
+/// .envrc context for the file being rendered.
+#[derive(Debug, Clone)]
+pub enum ResolvedValue {
+    /// A concrete value ready to be substituted into templates
+    Concrete(String),
+    /// A vault key — substitution deferred to deploy time
+    Vault(String),
+    /// A shell command — deferred to render time so the correct .envrc
+    /// (e.g. mcs/.envrc with KUBECONFIG) is applied when it runs
+    Shell(String),
+}
+
+impl ResolvedValue {
+    pub fn as_template_str(&self) -> String {
+        match self {
+            ResolvedValue::Concrete(v) => v.clone(),
+            ResolvedValue::Vault(key)  => format!("vault({})", key),
+            // Shell values should have been resolved before template rendering;
+            // if one slips through, surface it clearly rather than silently
+            // emitting an empty string.
+            ResolvedValue::Shell(cmd)  => format!("shell({})", cmd),
+        }
+    }
+}
+
+/// Parse a value string and resolve it to a ResolvedValue.
+/// shell() is NOT executed here — it is deferred to render time.
+fn resolve_value(
+    raw: &str,
+    memory: &mut serde_json::Map<String, serde_json::Value>,
+    memory_path: &Path,
+) -> anyhow::Result<ResolvedValue> {
+    let raw = raw.trim();
+
+    // shell(...) — deferred to render time so the correct .envrc context
+    // (KUBECONFIG etc.) is applied per platform file directory
+    if let Some(cmd) = strip_wrapper(raw, "shell(") {
+        return Ok(ResolvedValue::Shell(cmd.to_string()));
+    }
+
+    // onceshell(...) — run once eagerly, cache in values.memory.json.
+    // These should not depend on per-directory cluster context; if they do,
+    // use shell(...) instead.
+    if let Some(cmd) = strip_wrapper(raw, "onceshell(") {
+        let cache_key = format!("onceshell:{}", cmd);
+        if let Some(cached) = memory.get(&cache_key).and_then(|v| v.as_str()) {
+            println!("  ↩ onceshell cache hit: {}", &cmd[..cmd.len().min(40)]);
+            return Ok(ResolvedValue::Concrete(cached.to_string()));
+        }
+        println!("  ⚙ onceshell executing: {}", &cmd[..cmd.len().min(40)]);
+        let result = run_shell(cmd)?;
+        memory.insert(cache_key, serde_json::Value::String(result.clone()));
+        // persist memory immediately so partial runs are cached
+        fs::write(
+            memory_path,
+            serde_json::to_string_pretty(&serde_json::Value::Object(memory.clone()))?,
+        )?;
+        return Ok(ResolvedValue::Concrete(result));
+    }
+
+    // file(...) — read file contents relative to CWD (paths start with ./)
+    if let Some(path_str) = strip_wrapper(raw, "file(") {
+        let path_str = path_str.trim();
+        let content = fs::read_to_string(path_str)
+            .map_err(|e| anyhow::anyhow!(
+                "file({}) could not be read: {}",
+                path_str, e
+            ))?;
+        // Don't trim_end() — SSH keys and certs require a trailing newline
+        return Ok(ResolvedValue::Concrete(content));
+    }
+
+    // vault(...) — deferred, do not resolve now
+    if let Some(key) = strip_wrapper(raw, "vault(") {
+        return Ok(ResolvedValue::Vault(key.to_string()));
+    }
+
+    // env var interpolation — replace $VAR_NAME or ${VAR_NAME} with env value
+    let env_re = Regex::new(r"\$\{?([A-Z_][A-Z0-9_]*)\}?").unwrap();
+    if env_re.is_match(raw) {
+        let mut errors: Vec<String> = Vec::new();
+        let result = env_re.replace_all(raw, |caps: &regex::Captures| {
+            let var_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            match std::env::var(var_name) {
+                Ok(val) => val,
+                Err(_) => {
+                    errors.push(var_name.to_string());
+                    caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
+                }
+            }
+        }).to_string();
+        if !errors.is_empty() {
+            anyhow::bail!(
+                "Undefined environment variable(s): {}",
+                errors.join(", ")
+            );
+        }
+        return Ok(ResolvedValue::Concrete(result));
+    }
+
+    // plain string
+    Ok(ResolvedValue::Concrete(raw.to_string()))
+}
+
+fn strip_wrapper<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.starts_with(prefix) && s.ends_with(')') {
+        Some(&s[prefix.len()..s.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// Run a shell command with no extra env, used only by onceshell().
+fn run_shell(cmd: &str) -> anyhow::Result<String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn shell: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("shell command failed:\n  cmd: {}\n  err: {}", cmd, stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Run a shell command with a specific set of env vars injected.
+/// Used at render time when we know the file's .envrc context.
+fn run_shell_with_env(cmd: &str, env_vars: &HashMap<String, String>) -> anyhow::Result<String> {
+    let kubeconfig = env_vars
+        .get("KUBECONFIG")
+        .cloned()
+        .or_else(|| std::env::var("KUBECONFIG").ok())
+        .unwrap_or_else(|| "(not set)".to_string());
+    println!("    [shell] KUBECONFIG={}", kubeconfig);
+    println!("    [shell] cmd: {}", &cmd[..cmd.len().min(60)]);
+
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(cmd);
+    for (k, v) in env_vars {
+        command.env(k, v);
+    }
+
+    let output = command
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn shell: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("shell command failed:\n  cmd: {}\n  err: {}", cmd, stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// For a given file's env context, resolve any Shell values into Concrete ones.
+/// All other value types are passed through unchanged.
+pub fn resolve_shell_values(
+    resolved: &ResolvedValues,
+    env_vars: &HashMap<String, String>,
+) -> anyhow::Result<ResolvedValues> {
+    let mut out = ResolvedValues::new();
+    for (key, val) in resolved {
+        let concrete = match val {
+            ResolvedValue::Shell(cmd) => {
+                print!("  resolving shell {}... ", key);
+                let result = run_shell_with_env(cmd, env_vars)
+                    .map_err(|e| anyhow::anyhow!("Failed to resolve shell({}) for key {}: {}", cmd, key, e))?;
+                println!("✓");
+                ResolvedValue::Concrete(result)
+            }
+            other => other.clone(),
+        };
+        out.insert(key.clone(), concrete);
+    }
+    Ok(out)
+}
+
+// ── Values loading and resolution ─────────────────────────────────────────────
+
+/// Flat resolved map: "KEY" or "SECTION.KEY" or "A.B.C.D" → ResolvedValue
+pub type ResolvedValues = HashMap<String, ResolvedValue>;
+
+fn collect_keys(value: &serde_json::Value, prefix: &str, keys: &mut HashSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let full_key = if prefix.is_empty() { k.clone() } else { format!("{}.{}", prefix, k) };
+                collect_keys(v, &full_key, keys);
+            }
+        }
+        _ => { keys.insert(prefix.to_string()); }
+    }
+}
+
+fn check_unfilled(value: &serde_json::Value, prefix: &str, unfilled: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let full_key = if prefix.is_empty() { k.clone() } else { format!("{}.{}", prefix, k) };
+                check_unfilled(v, &full_key, unfilled);
+            }
+        }
+        serde_json::Value::Null => { unfilled.push(prefix.to_string()); }
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if (t.is_empty() || t == "CHANGE_ME")
+                && !t.starts_with("shell(")
+                && !t.starts_with("onceshell(")
+                && !t.starts_with("file(")
+                && !t.starts_with("vault(")
+                && !t.contains('$')
+            {
+                unfilled.push(prefix.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively walk the values JSON tree, resolving every leaf string.
+fn resolve_recursive(
+    value: &serde_json::Value,
+    prefix: &str,
+    memory: &mut serde_json::Map<String, serde_json::Value>,
+    memory_path: &Path,
+    resolved: &mut ResolvedValues,
+) -> anyhow::Result<()> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}.{}", prefix, k)
+                };
+                resolve_recursive(v, &key, memory, memory_path, resolved)?;
+            }
+        }
+        serde_json::Value::String(s) => {
+            print!("  resolving {}... ", prefix);
+            let resolved_val = resolve_value(s, memory, memory_path)
+                .map_err(|e| anyhow::anyhow!("Failed to resolve {}: {}", prefix, e))?;
+            match &resolved_val {
+                ResolvedValue::Concrete(_) => println!("✓"),
+                ResolvedValue::Vault(k)    => println!("⏳ vault({}) — deferred to deploy", k),
+                ResolvedValue::Shell(cmd)  => println!("⏳ shell({}) — deferred to render", &cmd[..cmd.len().min(40)]),
+            }
+            resolved.insert(prefix.to_string(), resolved_val);
+        }
+        other => {
+            // numbers, bools — convert to string as-is
+            print!("  resolving {}... ", prefix);
+            println!("✓");
+            resolved.insert(prefix.to_string(), ResolvedValue::Concrete(other.to_string()));
+        }
+    }
+    Ok(())
+}
+
+pub fn load_and_resolve_values(
+    values_path: &Path,
+    backup_path: &Path,
+    memory_path: &Path,
+) -> anyhow::Result<ResolvedValues> {
+    if values_path == backup_path {
+        anyhow::bail!("values.json and values.json.backup cannot be the same file.");
+    }
+
+    if !backup_path.exists() {
+        anyhow::bail!(
+            "values.json.backup not found — must be committed to git.\n\
+             It defines the expected shape of values.json."
+        );
+    }
+    let backup: serde_json::Value = serde_json::from_str(&fs::read_to_string(backup_path)?)
+        .map_err(|e| anyhow::anyhow!("Failed to parse values.json.backup: {e}"))?;
+
+    if !values_path.exists() {
+        anyhow::bail!(
+            "values.json not found.\n\
+             Copy values.json.backup → values.json and fill in real values.\n\
+             values.json is gitignored — never commit it."
+        );
+    }
+    let values: serde_json::Value = serde_json::from_str(&fs::read_to_string(values_path)?)
+        .map_err(|e| anyhow::anyhow!("Failed to parse values.json: {e}"))?;
+
+    // key sync check
+    let mut backup_keys: HashSet<String> = HashSet::new();
+    let mut values_keys: HashSet<String> = HashSet::new();
+    collect_keys(&backup, "", &mut backup_keys);
+    collect_keys(&values, "", &mut values_keys);
+
+    let mut missing: Vec<_> = backup_keys.difference(&values_keys).cloned().collect();
+    let mut extra: Vec<_>   = values_keys.difference(&backup_keys).cloned().collect();
+    missing.sort(); extra.sort();
+
+    let mut has_errors = false;
+    if !missing.is_empty() {
+        has_errors = true;
+        eprintln!("\n✗ Keys in values.json.backup MISSING from values.json:");
+        for k in &missing { eprintln!("    - {}", k); }
+        eprintln!("\n  Add them to values.json before running plan.");
+    }
+    if !extra.is_empty() {
+        has_errors = true;
+        eprintln!("\n✗ Keys in values.json NOT in values.json.backup:");
+        for k in &extra { eprintln!("    - {}", k); }
+        eprintln!("\n  Remove or add to values.json.backup and commit.");
+    }
+    if has_errors {
+        anyhow::bail!("values.json and values.json.backup are out of sync.");
+    }
+
+    // unfilled check
+    let mut unfilled: Vec<String> = Vec::new();
+    check_unfilled(&values, "", &mut unfilled);
+    unfilled.sort();
+    if !unfilled.is_empty() {
+        eprintln!("\n✗ Unfilled values in values.json:");
+        for k in &unfilled { eprintln!("    - {}", k); }
+        anyhow::bail!("Fill in all placeholder values before running plan.");
+    }
+
+    println!("✓ values.json validated ({} keys)", backup_keys.len());
+
+    // load memory cache
+    let mut memory: serde_json::Map<String, serde_json::Value> = if memory_path.exists() {
+        let raw = fs::read_to_string(memory_path)?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| if let serde_json::Value::Object(m) = v { Some(m) } else { None })
+            .unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+
+    // resolve all values recursively — shell() stays deferred
+    let mut resolved: ResolvedValues = ResolvedValues::new();
+    resolve_recursive(&values, "", &mut memory, memory_path, &mut resolved)?;
+
+    // persist final memory
+    fs::write(
+        memory_path,
+        serde_json::to_string_pretty(&serde_json::Value::Object(memory))?,
+    )?;
+
+    Ok(resolved)
+}
+
+// ── Template rendering ────────────────────────────────────────────────────────
+
+/// Substitute {{KEY}} or {{SECTION.KEY}} or {{A.B.C}} in template content.
+/// By the time this is called, all Shell values must already be resolved to
+/// Concrete via resolve_shell_values() — if any Shell slips through,
+/// as_template_str() will emit shell(...) visibly rather than silently empty.
+pub fn render_template(
+    content: &str,
+    template_name: &str,
+    resolved: &ResolvedValues,
+    snapshot: &Snapshot,
+) -> anyhow::Result<String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+    let ref_re = Regex::new(
+        r"\{\{\s*([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\s*(?:\|\s*(b64encode))?\s*\}\}"
+    ).unwrap();
+    let svc_re = Regex::new(r#"\{\{\s*services\["([^"]+)"\]\s*\}\}"#).unwrap();
+    let pkg_re = Regex::new(r#"\{\{\s*packages\["([^"]+)"\]\s*\}\}"#).unwrap();
+    let db_re  = Regex::new(r#"\{\{\s*databases\["([^"]+)"\]\s*\}\}"#).unwrap();
+
+    // ── validate all refs first ───────────────────────────────────────────────
+    let mut errors: Vec<String> = Vec::new();
+
+    for cap in ref_re.captures_iter(content) {
+        if let Some(key) = cap.get(1).map(|m| m.as_str()) {
+            if !resolved.contains_key(key) {
+                errors.push(format!("  {{{{{}}}}} — not found in values.json", key));
+            }
+        }
+    }
+    let svc_ids: HashSet<_> = snapshot.services.iter().map(|s| s.identifier.as_str()).collect();
+    for cap in svc_re.captures_iter(content) {
+        if let Some(id) = cap.get(1).map(|m| m.as_str()) {
+            if !svc_ids.contains(id) {
+                errors.push(format!("  services[\"{}\"] — not in snapshot.json", id));
+            }
+        }
+    }
+    let pkg_ids: HashSet<_> = snapshot.packages.iter().map(|p| p.identifier.as_str()).collect();
+    for cap in pkg_re.captures_iter(content) {
+        if let Some(id) = cap.get(1).map(|m| m.as_str()) {
+            if !pkg_ids.contains(id) {
+                errors.push(format!("  packages[\"{}\"] — not in snapshot.json", id));
+            }
+        }
+    }
+    let db_names: HashSet<_> = snapshot.databases.iter().map(|d| d.name.as_str()).collect();
+    for cap in db_re.captures_iter(content) {
+        if let Some(name) = cap.get(1).map(|m| m.as_str()) {
+            if !db_names.contains(name) {
+                errors.push(format!("  databases[\"{}\"] — not in snapshot.json", name));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "Template '{}' has undefined references:\n{}",
+            template_name, errors.join("\n")
+        );
+    }
+
+    // ── substitute value refs ─────────────────────────────────────────────────
+    let mut result = ref_re.replace_all(content, |caps: &regex::Captures| {
+        let key    = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let filter = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+        let value_str = match resolved.get(key) {
+            Some(v) => v.as_template_str(),
+            None    => return format!("{{{{{}}}}}", key),
+        };
+
+        match filter {
+            "b64encode" => BASE64.encode(value_str.as_bytes()),
+            _           => value_str,
+        }
+    }).to_string();
+
+    // ── substitute snapshot refs ──────────────────────────────────────────────
+    result = svc_re.replace_all(&result, |caps: &regex::Captures| {
+        let id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        snapshot.services.iter().find(|s| s.identifier == id)
+            .map(|s| s.version.clone()).unwrap_or_default()
+    }).to_string();
+
+    result = pkg_re.replace_all(&result, |caps: &regex::Captures| {
+        let id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        snapshot.packages.iter().find(|p| p.identifier == id)
+            .map(|p| p.version.clone()).unwrap_or_default()
+    }).to_string();
+
+    result = db_re.replace_all(&result, |caps: &regex::Captures| {
+        let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        snapshot.databases.iter().find(|d| d.name == name)
+            .map(|d| d.version.clone()).unwrap_or_default()
+    }).to_string();
+
+    Ok(result)
+}
+
+// ── File discovery ────────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq)]
+pub enum PlatformFileType {
+    Yaml,
+    Secrets,
+    Envrc,
+}
+
+#[derive(Debug)]
+pub struct PlatformFile {
+    pub absolute_path: PathBuf,
+    pub relative_path: PathBuf,
+    pub file_type: PlatformFileType,
+}
+
+fn discover_platform_files(platform_dir: &Path) -> Vec<PlatformFile> {
+    let mut files = Vec::new();
+
+    for entry in WalkDir::new(platform_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path().to_path_buf();
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        let file_type = if file_name == "secrets.yaml" {
+            PlatformFileType::Secrets
+        } else if file_name == ".envrc" {
+            PlatformFileType::Envrc
+        } else if file_name.ends_with(".yaml") || file_name.ends_with(".yml") {
+            PlatformFileType::Yaml
+        } else {
+            continue;
+        };
+
+        let relative_path = path.strip_prefix(platform_dir).unwrap_or(&path).to_path_buf();
+
+        files.push(PlatformFile { absolute_path: path, relative_path, file_type });
+    }
+
+    files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    files
+}
+
+// ── Build output ──────────────────────────────────────────────────────────────
+
+fn render_to_build(
+    files: &[PlatformFile],
+    platform_dir: &Path,
+    build_dir: &Path,
+    resolved: &ResolvedValues,
+    snapshot: &Snapshot,
+) -> anyhow::Result<()> {
+    use crate::run_dry_run::{find_envrc_bounded, parse_envrc};
+
+    if build_dir.exists() {
+        fs::remove_dir_all(build_dir)?;
+    }
+
+    // We walk up from each file's directory bounded by platform/ to find the
+    // nearest .envrc. This means platform/mcs/secrets.yaml picks up
+    // platform/mcs/.envrc (with its KUBECONFIG), not the root one.
+    let platform_dir_canonical = platform_dir.canonicalize()?;
+
+    for file in files {
+        let dest = build_dir.join(&file.relative_path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let raw = fs::read_to_string(&file.absolute_path)
+            .map_err(|e| anyhow::anyhow!("Cannot read '{}': {e}", file.absolute_path.display()))?;
+
+        let template_name = file.relative_path.to_string_lossy().to_string();
+
+        let rendered = if file.file_type == PlatformFileType::Envrc {
+            // .envrc is never templated — copy verbatim
+            raw
+        } else if raw.contains("{{") {
+            // Find the nearest .envrc walking up from this file's directory,
+            // bounded by platform/. This gives us the correct KUBECONFIG for
+            // any shell() commands that reference cluster secrets.
+            let file_dir = file.absolute_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| platform_dir.to_path_buf());
+
+            let env_vars = match find_envrc_bounded(&file_dir, &platform_dir_canonical) {
+                Some(envrc_path) => {
+                    println!(
+                        "  .envrc context for {}: {}",
+                        file.relative_path.display(),
+                        envrc_path.display()
+                    );
+                    let content = fs::read_to_string(&envrc_path).map_err(|e| {
+                        anyhow::anyhow!("Cannot read '{}': {e}", envrc_path.display())
+                    })?;
+                    parse_envrc(&content)
+                }
+                None => {
+                    // No .envrc found in platform/ — fall back to process env.
+                    // shell() commands will inherit whatever KUBECONFIG is set
+                    // in the environment that launched ginger-infra.
+                    HashMap::new()
+                }
+            };
+
+            // Resolve shell() values now that we have the correct env context
+            let contextual_resolved = resolve_shell_values(resolved, &env_vars)?;
+
+            render_template(&raw, &template_name, &contextual_resolved, snapshot)?
+        } else {
+            raw
+        };
+
+        fs::write(&dest, rendered)
+            .map_err(|e| anyhow::anyhow!("Cannot write '{}': {e}", dest.display()))?;
+
+        println!("  → build/{}", file.relative_path.display());
+    }
+
+    Ok(())
+}
+
+// ── Public entry point ────────────────────────────────────────────────────────
+
+pub fn run_plan() -> anyhow::Result<()> {
+    // 1. gitignore check — always first
+    check_gitignore()?;
+
+    // 2. load + validate snapshot
+    let snapshot_path = Path::new("snapshot.json");
+    if !snapshot_path.exists() {
+        anyhow::bail!("snapshot.json not found in current directory");
+    }
+    let snapshot: Snapshot = serde_json::from_str(&fs::read_to_string(snapshot_path)?)
+        .map_err(|e| anyhow::anyhow!("Failed to parse snapshot.json: {e}"))?;
+
+    println!("✓ Loaded snapshot.json");
+    println!(
+        "  services: {}  packages: {}  databases: {}",
+        snapshot.services.len(), snapshot.packages.len(), snapshot.databases.len()
+    );
+    validate_snapshot(&snapshot)?;
+
+    // 3. load + resolve values
+    // Note: shell() values are NOT executed here — they are deferred to
+    // render time (step 5) where we know which .envrc context applies.
+    println!("\n── Resolving values ─────────────────────────────────");
+    let resolved = load_and_resolve_values(
+        Path::new("values.json"),
+        Path::new("values.json.backup"),
+        Path::new("values.memory.json"),
+    )?;
+
+    let concrete_count = resolved.values().filter(|v| matches!(v, ResolvedValue::Concrete(_))).count();
+    let vault_count    = resolved.values().filter(|v| matches!(v, ResolvedValue::Vault(_))).count();
+    let shell_count    = resolved.values().filter(|v| matches!(v, ResolvedValue::Shell(_))).count();
+    println!(
+        "\n✓ Values resolved: {} concrete, {} vault (deferred to deploy), {} shell (deferred to render)",
+        concrete_count, vault_count, shell_count
+    );
+
+    // 4. discover platform files
+    let platform_dir = Path::new("platform");
+    if !platform_dir.exists() {
+        anyhow::bail!("platform/ directory not found");
+    }
+    let files = discover_platform_files(platform_dir);
+    if files.is_empty() {
+        anyhow::bail!("platform/ is empty — no .yaml/.yml/secrets.yaml files found");
+    }
+
+    let yaml_count    = files.iter().filter(|f| f.file_type == PlatformFileType::Yaml).count();
+    let secrets_count = files.iter().filter(|f| f.file_type == PlatformFileType::Secrets).count();
+    let envrc_count   = files.iter().filter(|f| f.file_type == PlatformFileType::Envrc).count();
+
+    println!("\n── Platform files ───────────────────────────────────");
+    println!("  {} yaml/yml  |  {} secrets.yaml  |  {} .envrc", yaml_count, secrets_count, envrc_count);
+
+    // 5. render to build/
+    // shell() values are resolved here, scoped to each file's nearest .envrc
+    // within platform/ — so platform/mcs/**  picks up platform/mcs/.envrc
+    // and gets the correct KUBECONFIG for that cluster.
+    println!("\n── Rendering to build/ ──────────────────────────────");
+    render_to_build(&files, platform_dir, Path::new("build"), &resolved, &snapshot)?;
+
+    println!("\n✓ Rendered {} files → build/", files.len());
+    if vault_count > 0 {
+        println!(
+            "  ⚠ {} vault values left as placeholders — will be resolved at deploy time",
+            vault_count
+        );
+    }
+    println!("\nNext: review build/ then run `ginger-infra deploy`");
+
+    Ok(())
+}
+
+=== portalInstaller.rs ===
+
+use std::{path::Path, process::exit};
+
+use colored::Colorize;
+use ginger_shared_rs::{read_service_config_file, utils::get_package_json_info};
+use IAMService::{
+    apis::{
+        configuration::Configuration as IAMConfiguration,
+        default_api::{identity_create_or_update_app, IdentityCreateOrUpdateAppParams},
+    },
+    models::CreateOrUpdateAppRequest,
+};
+
+pub async fn install_or_update_portal(
+    service_config_path: &Path,
+    iam_config: &IAMConfiguration,
+    releaser_path: &Path,
+    package_path: &Path,
+) {
+    let services_config = match read_service_config_file(service_config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("{:?}", e);
+            println!(
+                "There is no service configuration found or the existing one is invalid. Please use {} to add one. Exiting",
+                "ginger-connector init".blue()
+            );
+            exit(1);
+        }
+    };
+    println!("{:?}", services_config.portal_config);
+    println!("{:?}", services_config.urls);
+
+    // Properly handle the result of `get_package_json_info()`
+    let (pkg_name, version, description, organization, internal_dependencies) =
+        if let Some(info) = get_package_json_info() {
+            info
+        } else {
+            println!(
+                "{}",
+                "Failed to retrieve package.json information. Exiting.".red()
+            );
+            exit(1);
+        };
+
+    match identity_create_or_update_app(
+        &iam_config,
+        IdentityCreateOrUpdateAppParams {
+            create_or_update_app_request: CreateOrUpdateAppRequest {
+                client_id: services_config.portal_config.clone().unwrap().id,
+                name: Some(Some(
+                    services_config.portal_config.clone().unwrap().friendly_name,
+                )),
+                logo_url: Some(Some(
+                    services_config.portal_config.clone().unwrap().logo_url,
+                )),
+                disabled: Some(Some(
+                    services_config.portal_config.clone().unwrap().disabled,
+                )),
+                app_url_dev: Some(
+                    services_config
+                        .urls
+                        .as_ref()
+                        .and_then(|urls| urls.get("dev").cloned()),
+                ),
+                app_url_stage: Some(
+                    services_config
+                        .urls
+                        .as_ref()
+                        .and_then(|urls| urls.get("stage").cloned()),
+                ),
+                app_url_prod: Some(
+                    services_config
+                        .urls
+                        .as_ref()
+                        .and_then(|urls| urls.get("prod").cloned()),
+                ),
+                group_id: Some(
+                    services_config
+                        .portal_config
+                        .clone()
+                        .unwrap()
+                        .access_group_id,
+                ),
+                tnc_link: Some(services_config.portal_config.clone().unwrap().tnc_url),
+                allow_registration: Some(Some(
+                    services_config
+                        .portal_config
+                        .clone()
+                        .unwrap()
+                        .allow_registration,
+                )),
+                description: Some(Some(description)),
+                auth_redirection_path: Some(
+                    services_config
+                        .portal_config
+                        .clone()
+                        .unwrap()
+                        .auth_redirection_path,
+                ),
+                web_interface: Some(Some(
+                    services_config
+                        .portal_config
+                        .clone()
+                        .unwrap()
+                        .has_web_interface,
+                )),
+            },
+        },
+    )
+    .await
+    {
+        Ok(resp) => {
+            println!("{:?}", resp)
+        }
+        Err(err) => {
+            println!("{:?}", err)
+        }
+    }
+}
+
+
+=== rollout.rs ===
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use crate::run_dry_run::{collect_yamls, find_envrc_bounded, parse_envrc};
+
+// ── Vault loading ─────────────────────────────────────────────────────────────
+
+/// Load vault.json from cwd. Keys are vault secret names, values are plaintext.
+fn load_vault(vault_path: &Path) -> anyhow::Result<HashMap<String, String>> {
+    if !vault_path.exists() {
+        anyhow::bail!(
+            "vault.json not found in current directory.\n\
+             It must be a JSON object mapping secret keys to their plaintext values."
+        );
+    }
+
+    let raw = fs::read_to_string(vault_path)?;
+    let map: HashMap<String, String> = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("Failed to parse vault.json: {e}"))?;
+
+    println!("✓ vault.json loaded ({} secrets)", map.len());
+    Ok(map)
+}
+
+// ── Vault substitution ────────────────────────────────────────────────────────
+
+/// Replace all `vault(KEY)` placeholders in rendered YAML content with
+/// the plaintext values from vault.json.  Never writes anything to disk.
+fn substitute_vault(content: &str, vault: &HashMap<String, String>, label: &str) -> anyhow::Result<String> {
+    // We need a simple but correct parser: find vault(...) and replace.
+    // Using a hand-rolled approach to avoid pulling in another regex dep
+    // (regex is already a dep in plan.rs so it is available in the crate).
+    use regex::Regex;
+
+    let re = Regex::new(r"vault\(([^)]+)\)").unwrap();
+
+    let mut errors: Vec<String> = Vec::new();
+
+    let result = re.replace_all(content, |caps: &regex::Captures| {
+        let key = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        match vault.get(key) {
+            Some(v) => v.clone(),
+            None => {
+                errors.push(format!("vault key '{}' not found in vault.json", key));
+                // return placeholder so replacement is still a valid string
+                format!("vault({})", key)
+            }
+        }
+    }).to_string();
+
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "'{}' has unresolved vault references:\n{}",
+            label,
+            errors.iter().map(|e| format!("  - {}", e)).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    Ok(result)
+}
+
+// ── kubectl apply via stdin ───────────────────────────────────────────────────
+
+/// Pipe `content` into `kubectl apply -f -` with the given env vars.
+/// Nothing is written to disk.
+fn kubectl_apply_stdin(
+    content: &str,
+    env_vars: &HashMap<String, String>,
+    label: &str,
+) -> anyhow::Result<bool> {
+    let mut cmd = Command::new("kubectl");
+    cmd.args(["apply", "-f", "-"]);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("Failed to spawn kubectl: {}", e))?;
+
+    // write manifest to kubectl's stdin then close it
+    if let Some(stdin) = child.stdin.take() {
+        let mut stdin = stdin;
+        stdin.write_all(content.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Failed to write to kubectl stdin: {}", e))?;
+        // stdin drops here, closing the pipe
+    }
+
+    let output = child.wait_with_output()
+        .map_err(|e| anyhow::anyhow!("kubectl did not exit cleanly: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() {
+        for line in stdout.lines() {
+            println!("    {}", line);
+        }
+        Ok(true)
+    } else {
+        eprintln!("  ✗ {} — kubectl apply failed (exit {:?})", label, output.status.code());
+        for line in stderr.lines() {
+            eprintln!("    {}", line);
+        }
+        Ok(false)
+    }
+}
+
+// ── Public entry point ────────────────────────────────────────────────────────
+
+pub fn run_rollout() -> anyhow::Result<()> {
+    // ── 1. load vault.json (never written back, stays in memory) ─────────────
+    let vault = load_vault(Path::new("vault.json"))?;
+
+    // ── 2. run plan to populate build/ ───────────────────────────────────────
+    println!("\n── Running plan before rollout ──────────────────────");
+    crate::plan::run_plan()?;
+
+    // ── 3. collect yaml files from build/ ────────────────────────────────────
+    let build_dir = Path::new("build");
+    if !build_dir.exists() {
+        anyhow::bail!("build/ not found — plan must have failed");
+    }
+
+    let mut yaml_files: Vec<PathBuf> = Vec::new();
+    collect_yamls(build_dir, &mut yaml_files);
+    yaml_files.sort();
+
+    if yaml_files.is_empty() {
+        anyhow::bail!("build/ is empty — nothing to apply");
+    }
+
+    let build_dir_canonical = build_dir.canonicalize()?;
+
+    println!("\n── kubectl apply ────────────────────────────────────");
+
+    let mut applied: Vec<String> = Vec::new();
+    let mut failed:  Vec<String> = Vec::new();
+
+    // ── 4. for each file: vault-substitute in memory, pipe to kubectl ─────────
+    for file in &yaml_files {
+        let label = file
+            .strip_prefix(build_dir)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+
+        // read rendered content (vault placeholders still present)
+        let content = match fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  ✗ {} — cannot read file: {}", label, e);
+                failed.push(label);
+                continue;
+            }
+        };
+
+        // vault substitution entirely in memory
+        let final_content = match substitute_vault(&content, &vault, &label) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  ✗ {}", e);
+                failed.push(label);
+                continue;
+            }
+        };
+
+        // resolve .envrc scoped to this file's directory, bounded by build/
+        let file_dir = file.parent().map(Path::to_path_buf)
+            .unwrap_or_else(|| build_dir.to_path_buf());
+
+        let env_vars = match find_envrc_bounded(&file_dir, &build_dir_canonical) {
+            Some(envrc_path) => {
+                let envrc_content = match fs::read_to_string(&envrc_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("  ✗ {} — cannot read .envrc: {}", label, e);
+                        failed.push(label);
+                        continue;
+                    }
+                };
+                parse_envrc(&envrc_content)
+            }
+            None => HashMap::new(),
+        };
+
+        print!("  applying {} ... ", label);
+
+        match kubectl_apply_stdin(&final_content, &env_vars, &label) {
+            Ok(true) => {
+                applied.push(label);
+            }
+            Ok(false) => {
+                failed.push(label);
+            }
+            Err(e) => {
+                eprintln!("  ✗ {} — {}", label, e);
+                failed.push(label);
+            }
+        }
+    }
+
+    // ── 5. summary ────────────────────────────────────────────────────────────
+    println!("\n── Summary ──────────────────────────────────────────");
+
+    if !applied.is_empty() {
+        println!("  ✓ Applied ({}):", applied.len());
+        for r in &applied {
+            println!("      {}", r);
+        }
+    }
+
+    if !failed.is_empty() {
+        println!("  ✗ Failed ({}):", failed.len());
+        for r in &failed {
+            println!("      {}", r);
+        }
+    }
+
+    if failed.is_empty() {
+        println!("\n  ✓ Rollout complete — all resources applied successfully.");
+    }
+
+    println!();
+
+    if !failed.is_empty() {
+        anyhow::bail!("Rollout completed with {} error(s) — fix above before retrying", failed.len());
+    }
+
+    Ok(())
+}
+
+=== run_dry_run.rs ===
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+// ── .envrc discovery & parsing ────────────────────────────────────────────────
+
+/// Walk UP from `start` but STOP at (and never go above) `ceiling`.
+/// Prevents escaping the build/ directory and picking up a system .envrc.
+pub fn find_envrc_bounded(start: &Path, ceiling: &Path) -> Option<PathBuf> {
+    let ceiling = ceiling.canonicalize().ok()?;
+    let mut dir = start.canonicalize().ok()?;
+
+    loop {
+        if !dir.starts_with(&ceiling) {
+            return None;
+        }
+
+        let candidate = dir.join(".envrc");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+
+        if dir == ceiling {
+            return None;
+        }
+
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Parse `export KEY=VALUE` (and bare `KEY=VALUE`) lines from an `.envrc`.
+/// Expands `$HOME` and `${HOME}` using the real process environment.
+pub fn parse_envrc(content: &str) -> HashMap<String, String> {
+    let mut vars: HashMap<String, String> = HashMap::new();
+
+    for raw in content.lines() {
+        let line = raw.trim();
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let line = line.strip_prefix("export ").unwrap_or(line);
+
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim().to_string();
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value);
+            let value = expand_home(value);
+            vars.insert(key, value);
+        }
+    }
+
+    vars
+}
+
+/// Replace `$HOME` and `${HOME}` with the value of the `HOME` env var.
+pub fn expand_home(s: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    s.replace("${HOME}", &home).replace("$HOME", &home)
+}
+
+// ── yaml collection ───────────────────────────────────────────────────────────
+
+pub fn collect_yamls(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_yamls(&path, out);
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if ext == "yaml" || ext == "yml" {
+                    out.push(path);
+                }
+            }
+        }
+    }
+}
+
+// ── main entry point ──────────────────────────────────────────────────────────
+
+/// Runs the full plan pipeline then for each rendered file in build/
+/// calls `kubectl diff -f <file>` to show what would change in the cluster.
+/// Picks up KUBECONFIG (and any other vars) from the nearest `.envrc` walking
+/// up from the current working directory.  Does NOT apply anything.
+pub fn run_dry_run() -> anyhow::Result<()> {
+    // ── 1. run plan to populate build/ ────────────────────────────────────────
+    println!("\n── Running plan before dry-run ──────────────────────");
+    crate::plan::run_plan()?;
+
+    // ── 2. collect yaml files ─────────────────────────────────────────────────
+    let build_dir = Path::new("build");
+    if !build_dir.exists() {
+        anyhow::bail!("build/ not found — plan must have failed");
+    }
+
+    let mut yaml_files: Vec<PathBuf> = Vec::new();
+    collect_yamls(build_dir, &mut yaml_files);
+    yaml_files.sort();
+
+    if yaml_files.is_empty() {
+        anyhow::bail!("build/ is empty — nothing to diff");
+    }
+
+    println!("\n── kubectl diff ─────────────────────────────────────");
+
+    let mut any_diff  = false;
+    let mut any_new   = false;
+    let mut any_error = false;
+    let mut new_resources:     Vec<String> = Vec::new();
+    let mut changed_resources: Vec<String> = Vec::new();
+    let mut error_resources:   Vec<String> = Vec::new();
+
+    // ── 3. diff each file ─────────────────────────────────────────────────────
+    let build_dir_canonical = build_dir.canonicalize()?;
+
+    for file in &yaml_files {
+        let label = file
+            .strip_prefix(build_dir)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+
+        let file_dir = file.parent().map(Path::to_path_buf)
+            .unwrap_or_else(|| build_dir.to_path_buf());
+
+        let env_vars = match find_envrc_bounded(&file_dir, &build_dir_canonical) {
+            Some(envrc_path) => {
+                let content = fs::read_to_string(&envrc_path)?;
+                parse_envrc(&content)
+            }
+            None => HashMap::new(),
+        };
+
+        let mut cmd = Command::new("kubectl");
+        cmd.args(["diff", "-f"]).arg(file);
+        for (k, v) in &env_vars {
+            cmd.env(k, v);
+        }
+
+        let output = cmd.output();
+
+        match output {
+            Err(e) => {
+                eprintln!("  ✗ {} — failed to run kubectl: {}", label, e);
+                error_resources.push(label);
+                any_error = true;
+            }
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+
+                match out.status.code() {
+                    Some(0) => {
+                        println!("  ✓ {} — no changes", label);
+                    }
+                    Some(1) => {
+                        if stderr.contains("not found") || stderr.contains("NotFound") {
+                            println!("  ✦ {} — NEW (will be created)", label);
+                            new_resources.push(label);
+                            any_new = true;
+                        } else {
+                            println!("\n  ~ {} — changes:", label);
+                            for line in stdout.lines() {
+                                if line.starts_with('+') {
+                                    println!("    \x1b[32m{}\x1b[0m", line);
+                                } else if line.starts_with('-') {
+                                    println!("    \x1b[31m{}\x1b[0m", line);
+                                } else {
+                                    println!("    {}", line);
+                                }
+                            }
+                            changed_resources.push(label);
+                            any_diff = true;
+                        }
+                    }
+                    Some(code) => {
+                        eprintln!(
+                            "  ✗ {} — kubectl error (exit {}): {}",
+                            label, code, stderr.trim()
+                        );
+                        error_resources.push(label);
+                        any_error = true;
+                    }
+                    None => {
+                        eprintln!("  ✗ {} — kubectl killed by signal", label);
+                        any_error = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 4. summary ────────────────────────────────────────────────────────────
+    println!("\n── Summary ──────────────────────────────────────────");
+
+    if !new_resources.is_empty() {
+        println!("  ✦ New ({}):", new_resources.len());
+        for r in &new_resources { println!("      {}", r); }
+    }
+    if !changed_resources.is_empty() {
+        println!("  ~ Changed ({}):", changed_resources.len());
+        for r in &changed_resources { println!("      {}", r); }
+    }
+    if !error_resources.is_empty() {
+        println!("  ✗ Errors ({}):", error_resources.len());
+        for r in &error_resources { println!("      {}", r); }
+    }
+    if !any_diff && !any_new && !any_error {
+        println!("  ✓ No changes — cluster is already up to date");
+    }
+
+    println!();
+    if any_error {
+        anyhow::bail!("Dry run completed with errors — fix above before deploying");
+    }
+    if any_diff || any_new {
+        println!("Run `ginger-infra deploy` to apply these changes.");
+    }
+
+    Ok(())
+}
+
+=== start.rs ===
+
+use IAMService::models::ValidateApiTokenResponse;
+use MetadataService::apis::{configuration::Configuration as MetadataConfiguration, default_api::{MetadataGetPackageVersionPlainTextParams, metadata_get_package_version_plain_text}};
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
+
+use crate::{wamp_args, wamp_client::WampClient};
+
+
+#[derive(Deserialize)]
+struct InstallSslArgs {
+    domain: String,
+}
+
+#[derive(Deserialize)]
+struct PortMapping {
+    container_port: u16,
+    host_port: u16,
+    protocol: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateClusterArgs {
+    name: String,
+    api_port: u16,
+    port_mappings: Vec<PortMapping>,
+    #[serde(default = "default_cpus")]
+    cpus: u16,
+    #[serde(default = "default_memory")]
+    memory: String,
+    #[serde(default = "default_disk")]
+    disk: String,
+}
+
+fn default_cpus() -> u16 { 2 }
+fn default_memory() -> String { "4g".to_string() }
+fn default_disk() -> String { "30g".to_string() }
+
+#[derive(Deserialize)]
+struct SetupGatewayArgs {
+    domain: String,
+    port: u16,
+    #[serde(default)]
+    websocket: bool,
+}
+
+#[derive(Deserialize)]
+struct DeleteClusterArgs {
+    name: String,
+}
+
+
+#[derive(Deserialize)]
+struct DeleteGatewayArgs {
+    domain: String,
+}
+
+
+pub async fn main(access_token: String, token_response: ValidateApiTokenResponse, metadata_config: &MetadataConfiguration, device_id: String) {
+    let client = Arc::new(WampClient::new(
+        &format!("{}.ginger_infra", device_id),
+        &access_token,
+        &token_response.sub,
+    ));
+
+
+    client.register("delete_cluster", |args, _kwargs| async move {
+
+        let parsed: DeleteClusterArgs = wamp_args!(args)?;
+        let name = &parsed.name;
+
+        println!("[delete_cluster] deleting cluster '{}'", name);
+
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                r#"curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/ginger-infra-helpers/delete-kind-cluster.sh | bash -s -- {}"#,
+                name
+            ))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| json!({"error": format!("failed to spawn script: {}", e)}))?;
+
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    eprintln!("[delete_cluster] stderr: {}", line);
+                }
+            });
+        }
+
+        let status = child.wait().await
+            .map_err(|e| json!({"error": format!("failed to wait for script: {}", e)}))?;
+
+        if !status.success() {
+            let exit_code = status.code().unwrap_or(-1);
+            let error_msg = match exit_code {
+                2 => format!("cluster '{}' does not exist", name),
+                3 => "kind delete cluster failed".to_string(),
+                4 => "nginx reload failed after removing cluster entry".to_string(),
+                _ => format!("script failed with exit code {}", exit_code),
+            };
+            return Err(json!({
+                "error": error_msg,
+                "exit_code": exit_code,
+            }));
+        }
+
+        println!("[delete_cluster] cluster '{}' deleted successfully", name);
+
+        Ok(json!({
+            "status": "deleted",
+            "cluster": name,
+        }))
+    }).await;
+
+
+    client.register("install_ssl", |args, _kwargs| async move {
+        let mut parsed: InstallSslArgs = wamp_args!(args)?;
+        parsed.domain = parsed.domain.trim().to_string();
+
+        println!("[install_ssl] requesting cert for domain={}", parsed.domain);
+
+        // Server sends base_domain directly (e.g. "feat-19.ginger-society.test-clusters.rackmint.com")
+        // No stripping needed — use as-is
+        let base_domain = parsed.domain.clone();
+
+        let wildcard_cert_path = format!("/etc/letsencrypt/live/{}/privkey.pem", base_domain);
+
+        // Fast path — cert already exists, no lock needed
+        if std::path::Path::new(&wildcard_cert_path).exists() {
+            println!("[install_ssl] wildcard cert already exists at {}, skipping certbot", wildcard_cert_path);
+            return Ok(json!({
+                "status": "already_installed",
+                "domain": parsed.domain,
+                "base_domain": base_domain,
+                "cert_path": wildcard_cert_path,
+            }));
+        }
+
+        // ── Serialize concurrent certbot calls with a file lock ───────────────
+        let lock_path = "/tmp/certbot.lock";
+        let lock_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(lock_path)
+            .await
+            .map_err(|e| json!({"error": format!("failed to open lock file: {}", e)}))?;
+
+        use std::os::unix::io::IntoRawFd;
+        let fd = lock_file.into_std().await.into_raw_fd();
+        unsafe { libc::flock(fd, libc::LOCK_EX); }
+
+        // Re-check after acquiring lock — a concurrent call may have installed it
+        if std::path::Path::new(&wildcard_cert_path).exists() {
+            unsafe { libc::flock(fd, libc::LOCK_UN); }
+            println!("[install_ssl] wildcard cert installed by concurrent call, skipping");
+            return Ok(json!({
+                "status": "already_installed",
+                "domain": parsed.domain,
+                "base_domain": base_domain,
+                "cert_path": wildcard_cert_path,
+            }));
+        }
+
+        println!("[install_ssl] issuing wildcard cert for base_domain={}", base_domain);
+
+        let output = tokio::process::Command::new("certbot")
+            .arg("certonly")
+            .arg("--authenticator").arg("dns-godaddy")
+            .arg("--dns-godaddy-credentials").arg("/etc/letsencrypt/godaddy.ini")
+            .arg("--non-interactive")
+            .arg("--agree-tos")
+            .arg("--register-unsafely-without-email")
+            .arg("-d").arg(&base_domain)
+            .arg("-d").arg(format!("*.{}", base_domain))
+            .output()
+            .await
+            .map_err(|e| {
+                unsafe { libc::flock(fd, libc::LOCK_UN); }
+                json!({"error": format!("failed to run certbot: {}", e)})
+            })?;
+
+        unsafe { libc::flock(fd, libc::LOCK_UN); }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        println!("[install_ssl] certbot stdout:\n{}", stdout);
+        println!("[install_ssl] certbot stderr:\n{}", stderr);
+
+        if !output.status.success() {
+            return Err(json!({
+                "error": "certbot failed",
+                "exit_code": output.status.code(),
+                "domain": parsed.domain,
+                "base_domain": base_domain,
+                "stdout": stdout,
+                "stderr": stderr,
+            }));
+        }
+
+        Ok(json!({
+            "status": "installed",
+            "domain": parsed.domain,
+            "base_domain": base_domain,
+            "cert_path": wildcard_cert_path,
+            "stdout": stdout,
+        }))
+    }).await;
+
+    client.register("delete_gateway", |args, _kwargs| async move {
+        let parsed: DeleteGatewayArgs = wamp_args!(args)?;
+
+        println!(
+            "[delete_gateway] domain={}",
+            parsed.domain
+        );
+
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                r#"curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/ginger-infra-helpers/delete-gateway.sh | bash -s -- --domain {}"#,
+                parsed.domain
+            ))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| json!({"error": format!("failed to spawn delete-gateway.sh: {}", e)}))?;
+
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| json!({"error": format!("failed to wait on delete-gateway.sh: {}", e)}))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if !output.status.success() {
+            return Err(json!({
+                "error": "delete-gateway.sh failed",
+                "exit_code": output.status.code(),
+                "domain": parsed.domain,
+                "stdout": stdout,
+                "stderr": stderr,
+            }));
+        }
+
+        Ok(json!({
+            "status": "deleted",
+            "domain": parsed.domain,
+            "stdout": stdout,
+        }))
+    }).await;
+
+    
+    client.register("setup_gateway", |args, _kwargs| async move {
+        let parsed: SetupGatewayArgs = wamp_args!(args)?;
+    
+        println!(
+            "[setup_gateway] domain={} port={} websocket={}",
+            parsed.domain, parsed.port, parsed.websocket
+        );
+    
+        let ws_flag = if parsed.websocket { "--websocket" } else { "" };
+    
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                r#"curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/ginger-infra-helpers/setup-gateway.sh | bash -s -- --domain {} --port {} {}"#,
+                parsed.domain, parsed.port, ws_flag
+            ))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| json!({"error": format!("failed to spawn setup-gateway.sh: {}", e)}))?;
+    
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| json!({"error": format!("failed to wait on setup-gateway.sh: {}", e)}))?;
+    
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    
+        if !output.status.success() {
+            return Err(json!({
+                "error": "setup-gateway.sh failed",
+                "exit_code": output.status.code(),
+                "domain": parsed.domain,
+                "stdout": stdout,
+                "stderr": stderr,
+            }));
+        }
+    
+        Ok(json!({
+            "status": "configured",
+            "domain": parsed.domain,
+            "port": parsed.port,
+            "websocket": parsed.websocket,
+            "stdout": stdout,
+        }))
+    }).await;
+
+    client.register("create_cluster", |args, _kwargs| async move {
+        let parsed: CreateClusterArgs = wamp_args!(args)?;
+
+        let name = &parsed.name;
+        let api_port = parsed.api_port.to_string();
+
+        let port_mappings = serde_json::to_string(&json!(parsed.port_mappings
+            .iter()
+            .map(|p| json!({
+                "container_port": p.container_port,
+                "host_port": p.host_port,
+                "protocol": p.protocol.as_deref().unwrap_or("TCP"),
+            }))
+            .collect::<Vec<_>>()
+        )).map_err(|e| json!({"error": format!("failed to serialize port mappings: {}", e)}))?;
+
+        println!(
+            "[create_cluster] name={} api_port={} cpus={} memory={} disk={}",
+            name, api_port, parsed.cpus, parsed.memory, parsed.disk
+        );
+        println!("[create_cluster] port_mappings={}", port_mappings);
+
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                r#"curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/ginger-infra-helpers/create-kind-cluster.sh | bash -s -- {} {} '{}' --cpus {} --memory {} --disk {}"#,
+                name, api_port, port_mappings, parsed.cpus, parsed.memory, parsed.disk
+            ))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| json!({"error": format!("failed to spawn script: {}", e)}))?;
+
+        // stream stderr to logs in real time
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    eprintln!("[create_cluster] stderr: {}", line);
+                }
+            });
+        }
+
+        // stream stdout to logs and capture it
+        let mut stdout_lines = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            use tokio::io::AsyncBufReadExt;
+            let mut reader = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                println!("[create_cluster] stdout: {}", line);
+                stdout_lines.push(line);
+            }
+        }
+
+        let status = child.wait().await
+            .map_err(|e| json!({"error": format!("failed to wait for script: {}", e)}))?;
+
+        let stdout = stdout_lines.join("\n");
+
+        if !status.success() {
+            let exit_code = status.code().unwrap_or(-1);
+            let error_msg = match exit_code {
+                2 => format!("cluster '{}' already exists", name),
+                3 => "kind create cluster failed".to_string(),
+                4 => "nginx reload failed after updating stream config".to_string(),
+                5 => "failed to get kubeconfig".to_string(),
+                _ => format!("script failed with exit code {}", exit_code),
+            };
+            return Err(json!({
+                "error": error_msg,
+                "exit_code": exit_code,
+            }));
+        }
+
+        let kubeconfig = stdout
+            .split("KUBECONFIG_START")
+            .nth(1)
+            .and_then(|s| s.split("KUBECONFIG_END").next())
+            .map(|s| s.trim().to_string())
+            .ok_or_else(|| json!({"error": "failed to extract kubeconfig from output"}))?;
+
+        println!("[create_cluster] cluster '{}' created successfully", name);
+
+        Ok(json!({
+            "status": "created",
+            "cluster": name,
+            "api_port": parsed.api_port,
+            "port_mappings": parsed.port_mappings.iter().map(|p| json!({
+                "container_port": p.container_port,
+                "host_port": p.host_port,
+                "protocol": p.protocol.as_deref().unwrap_or("TCP"),
+            })).collect::<Vec<_>>(),
+            "kubeconfig": kubeconfig,
+        }))
+    }).await;
+
+
+    let metadata_config_ref = metadata_config.clone();
+
+    client.register("self_update", move |_args, _kwargs| {
+        let metadata_config = metadata_config_ref.clone();
+        async move {
+            let current_version = env!("CARGO_PKG_VERSION");
+
+            let latest_version = match metadata_get_package_version_plain_text(
+                &metadata_config,
+                MetadataGetPackageVersionPlainTextParams {
+                    org_id: "ginger-society".to_string(),
+                    package_name: "ginger-infra".to_string(),
+                },
+            ).await {
+                Ok(v) => v.trim().to_string(),
+                Err(e) => return Err(json!({"error": format!("failed to fetch version: {}", e)})),
+            };
+
+            println!("[self_update] current={} latest={}", current_version, latest_version);
+
+            if current_version == latest_version {
+                println!("[self_update] already up to date");
+                return Ok(json!({"status": "up_to_date", "version": current_version}));
+            }
+
+            let status = tokio::process::Command::new("bash")
+                .arg("-c")
+                .arg(r#"bash -c "$(curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/rust-helpers/installer.sh)" -- ginger-society/ginger-infra:latest"#)
+                .status()
+                .await
+                .map_err(|e| json!({"error": format!("failed to run installer: {}", e)}))?;
+
+            if !status.success() {
+                return Err(json!({
+                    "error": "installer failed",
+                    "exit_code": status.code()
+                }));
+            }
+
+            tokio::spawn(async {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                std::process::exit(0);
+            });
+
+            Ok(json!({"status": "updated", "from": current_version, "to": latest_version}))
+        }
+    }).await;
+
+    // spawn heartbeat as a separate task — nothing to do with WampClient internals
+    let heartbeat_client = Arc::clone(&client);
+    let heartbeat_topic = format!("heartbeat.{}.ginger_infra_{}", device_id, token_response.sub);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        interval.tick().await; // discard immediate tick
+        loop {
+            interval.tick().await;
+            if heartbeat_client.is_connected() {
+                let stats = crate::heartbeat::collect_stats();
+                if let Err(e) = heartbeat_client.publish(&heartbeat_topic, stats).await {
+                    eprintln!("[heartbeat] publish failed: {}", e);
+                }
+            }
+        }
+    });
+
+    client.listen().await;
+}
+
+=== verbose_replace.rs ===
+
+use std::fs;
+use std::path::Path;
+
+use crate::plan::{load_and_resolve_values, render_template, Snapshot};
+
+pub fn run_verbose_replace(input_path: &Path, output_path: Option<&Path>) -> anyhow::Result<()> {
+    // load snapshot
+    let snapshot_path = Path::new("snapshot.json");
+    if !snapshot_path.exists() {
+        anyhow::bail!("snapshot.json not found in current directory");
+    }
+    let snapshot: Snapshot = serde_json::from_str(&fs::read_to_string(snapshot_path)?)
+        .map_err(|e| anyhow::anyhow!("Failed to parse snapshot.json: {e}"))?;
+
+    // load + resolve values
+    let resolved = load_and_resolve_values(
+        Path::new("values.json"),
+        Path::new("values.json.backup"),
+        Path::new("values.memory.json"),
+    )?;
+
+    // read input file
+    if !input_path.exists() {
+        anyhow::bail!("Input file not found: {}", input_path.display());
+    }
+    let content = fs::read_to_string(input_path)
+        .map_err(|e| anyhow::anyhow!("Cannot read '{}': {e}", input_path.display()))?;
+
+    // render
+    let template_name = input_path.to_string_lossy().to_string();
+    let rendered = render_template(&content, &template_name, &resolved, &snapshot)?;
+
+    // write or print
+    match output_path {
+        Some(p) => {
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(p, &rendered)
+                .map_err(|e| anyhow::anyhow!("Cannot write '{}': {e}", p.display()))?;
+            println!("✓ Written to {}", p.display());
+        }
+        None => print!("{}", rendered),
+    }
+
+    Ok(())
+}
+
+=== wamp_client.rs ===
+
+// src/wamp_client.rs
+//
+// Declarative WAMP-like client for the GingerSociety notification broker.
+//
+// Usage (callee / service):
+// ─────────────────────────────────
+//   let mut client = WampClient::new("ginger_infra", access_token, realm).await;
+//
+//   client.register("snap_install", |args, kwargs| async move {
+//       let package = args[0].as_str().unwrap_or("").to_string();
+//       Ok(serde_json::json!({"status": "installed", "package": package}))
+//   });
+//
+//   client.listen().await;
+//
+// Usage (caller / any other service):
+// ─────────────────────────────────────
+//   let client = WampClient::new("my_service", access_token, realm).await;
+//
+//   let result = client.call(
+//       "ginger_infra",          // target service prefix
+//       workspace_id,            // target workspace realm
+//       "snap_install",          // function name
+//       json!(["certbot"]),      // args
+//       json!({"classic": true}),// kwargs
+//   ).await?;
+//
+// Usage (fire-and-forget publish):
+// ─────────────────────────────────
+//   // listen() must be running (in a spawned task) before calling publish()
+//   client.publish("some.topic", json!({"key": "value"})).await?;
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::{oneshot, Mutex};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+
+// ── WAMP-style message types (mirrors broker's requests.rs) ──────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WampPublish {
+    pub message_type: u8,
+    pub request_id: u64,
+    pub options: WampPublishOptions,
+    pub topic: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kwargs: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WampPublishOptions {
+    #[serde(default)]
+    pub acknowledge: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WampEvent {
+    pub message_type: u8,
+    pub subscription_id: String,
+    pub publication_id: u64,
+    pub details: WampEventDetails,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kwargs: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WampEventDetails {
+    pub timestamp: String,
+    pub topic: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerError {
+    pub message_type: u8,
+    pub error: String,
+    pub correlation_id: Option<String>,
+    pub topic: Option<String>,
+}
+
+// ── handler type ──────────────────────────────────────────────────────────────
+
+/// Ok(Value) — success payload
+/// Err(Value) — error payload, will set is_error: true in the reply
+pub type HandlerResult = Result<Value, Value>;
+pub type Handler = Arc<
+    dyn Fn(Option<Value>, Option<Value>) -> Pin<Box<dyn Future<Output = HandlerResult> + Send>>
+        + Send
+        + Sync,
+>;
+
+// ── pending call tracker (for caller side) ───────────────────────────────────
+
+type PendingCalls = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, Value>>>>>;
+
+// ── outbound publish channel ──────────────────────────────────────────────────
+
+type PublishTx = Arc<Mutex<Option<tokio::sync::mpsc::Sender<WampPublish>>>>;
+
+// ── WampClient ────────────────────────────────────────────────────────
+
+pub struct WampClient {
+    /// Service prefix e.g. "ginger_infra"
+    prefix: String,
+    /// Token sub — workspace/user id
+    realm: String,
+    /// Full channel name = "{prefix}_{sub}"
+    channel: String,
+    /// WebSocket URL
+    url: String,
+    /// Registered RPC handlers (callee side)
+    handlers: Arc<Mutex<HashMap<String, Handler>>>,
+    /// Pending outbound calls waiting for a reply (caller side)
+    pending: PendingCalls,
+    /// Sender half of the outbound publish channel; None until listen() starts
+    publish_tx: PublishTx,
+    /// True while the WebSocket connection is alive
+    pub is_connected: Arc<AtomicBool>,
+}
+
+pub type SharedWampClient = Arc<WampClient>;
+
+
+impl WampClient {
+    /// Create a new client.
+    /// `prefix`       — service name e.g. "ginger_infra"
+    /// `access_token` — JWT used to authenticate the WebSocket
+    /// `realm`        — token subject (workspace id); channel = "{prefix}_{sub}"
+    pub fn new(prefix: &str, access_token: &str, realm: &str) -> Self {
+        let broker_url = std::env::var("NOTIFICATION_BROKER_URL")
+            .unwrap_or_else(|_| "wss://api.gingersociety.org".to_string());
+
+        let channel = format!("{}_{}", prefix, realm);
+        let url = format!(
+            "{}/notification/ws/{}?token={}",
+            broker_url, channel, access_token
+        );
+
+        Self {
+            prefix: prefix.to_string(),
+            realm: realm.to_string(),
+            channel,
+            url,
+            handlers: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            publish_tx: Arc::new(Mutex::new(None)),
+            is_connected: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.is_connected.load(Ordering::Relaxed)
+    }
+
+    /// Register an RPC handler for a function name.
+    /// The handler receives (args, kwargs) and returns a JSON result or JSON error.
+    pub async fn register<F, Fut>(&self, function: &str, handler: F)
+    where
+        F: Fn(Option<Value>, Option<Value>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = HandlerResult> + Send + 'static,
+    {
+        let boxed: Handler = Arc::new(move |args, kwargs| Box::pin(handler(args, kwargs)));
+        self.handlers
+            .lock()
+            .await
+            .insert(function.to_string(), boxed);
+        println!("[client] registered handler for '{}'", function);
+    }
+
+    /// Fire-and-forget publish to any topic.
+    /// `listen()` must be running (e.g. in a spawned task) before calling this.
+    pub async fn publish(&self, topic: &str, kwargs: Value) -> Result<(), String> {
+        let guard = self.publish_tx.lock().await;
+        let tx = guard
+            .as_ref()
+            .ok_or_else(|| "not connected — call listen() first".to_string())?;
+
+        let msg = WampPublish {
+            message_type: 16,
+            request_id: rand_u64(),
+            options: WampPublishOptions {
+                acknowledge: false,
+                correlation_id: None,
+                reply_to: None,
+            },
+            topic: topic.to_string(),
+            args: None,
+            kwargs: Some(kwargs),
+        };
+
+        tx.send(msg).await.map_err(|e| e.to_string())
+    }
+
+    /// Start listening — blocks until shutdown signal.
+    /// Dispatches incoming RPC calls to registered handlers and sends results back.
+    /// Also drains the outbound publish channel onto the websocket.
+    pub async fn listen(&self) {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // signal handler
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("Failed to bind SIGTERM");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("Failed to listen for ctrl_c");
+            }
+            println!("\n[client] shutdown signal received.");
+            let _ = shutdown_tx.send(true);
+        });
+
+        // create the outbound publish channel and store the sender so publish() can use it
+        let (pub_tx, mut pub_rx) = tokio::sync::mpsc::channel::<WampPublish>(32);
+        *self.publish_tx.lock().await = Some(pub_tx);
+
+        let mut attempt: u32 = 0;
+
+        loop {
+            if *shutdown_rx.borrow() {
+                println!("[client] exiting.");
+                return;
+            }
+
+            if attempt > 0 {
+                let backoff = std::cmp::min(60, 1_u64.saturating_mul(attempt.min(6).into()));
+                println!(
+                    "[client] reconnecting in {}s... (attempt #{})",
+                    backoff,
+                    attempt + 1
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(backoff)) => {}
+                    _ = shutdown_rx.changed() => {
+                        println!("[client] exiting during backoff.");
+                        return;
+                    }
+                }
+            }
+
+            println!("[client] connecting to {}...", self.channel);
+
+            let conn = tokio::time::timeout(
+                tokio::time::Duration::from_secs(15),
+                connect_async(&self.url),
+            )
+            .await;
+
+            let mut ws_stream = match conn {
+                Ok(Ok((stream, _))) => {
+                    println!("✅ [client] connected on channel '{}'", self.channel);
+                    self.is_connected.store(true, Ordering::Relaxed);
+                    attempt = 0;
+                    stream
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[client] connection failed: {:?}", e);
+                    attempt += 1;
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("[client] connection timed out after 15s.");
+                    attempt += 1;
+                    continue;
+                }
+            };
+
+            let mut ping_interval = tokio::time::interval(
+                tokio::time::Duration::from_secs(PING_INTERVAL_SECS),
+            );
+            ping_interval.tick().await; // discard immediate tick
+
+            let mut waiting_for_pong = false;
+            let mut pong_timeout: Option<Pin<Box<tokio::time::Sleep>>> = None;
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    _ = shutdown_rx.changed() => {
+                        println!("[client] shutting down, closing connection...");
+                        self.is_connected.store(false, Ordering::Relaxed);
+                        let _ = ws_stream.close(None).await;
+                        while let Some(Ok(msg)) = ws_stream.next().await {
+                            if msg.is_close() { break; }
+                        }
+                        return;
+                    }
+
+                    _ = ping_interval.tick() => {
+                        if waiting_for_pong {
+                            eprintln!("[client] pong not received — reconnecting...");
+                            break;
+                        }
+                        if let Err(e) = ws_stream.send(Message::Ping(vec![].into())).await {
+                            eprintln!("[client] ping failed: {:?} — reconnecting...", e);
+                            break;
+                        }
+                        waiting_for_pong = true;
+                        pong_timeout = Some(Box::pin(tokio::time::sleep(
+                            tokio::time::Duration::from_secs(PING_TIMEOUT_SECS),
+                        )));
+                    }
+
+                    _ = async {
+                        if let Some(ref mut t) = pong_timeout { t.await }
+                        else { std::future::pending::<()>().await }
+                    } => {
+                        eprintln!("[client] pong timeout — reconnecting...");
+                        break;
+                    }
+
+                    Some(outbound) = pub_rx.recv() => {
+                        let msg = serde_json::to_string(&outbound).unwrap();
+                        if let Err(e) = ws_stream.send(Message::Text(msg.into())).await {
+                            eprintln!("[client] outbound publish failed: {:?} — reconnecting...", e);
+                            break;
+                        }
+                        println!("[client] → PUBLISH topic='{}'", outbound.topic);
+                    }
+
+                    msg_result = ws_stream.next() => {
+                        match msg_result {
+                            Some(Ok(msg)) => {
+                                if msg.is_pong() {
+                                    waiting_for_pong = false;
+                                    pong_timeout = None;
+                                    continue;
+                                }
+                                if msg.is_close() {
+                                    println!("[client] server closed connection — reconnecting...");
+                                    break;
+                                }
+                                if msg.is_ping() { continue; }
+
+                                let text = msg.into_text().unwrap_or_default();
+                                if text.is_empty() { continue; }
+
+                                self.handle_message(&text, &mut ws_stream).await;
+                            }
+                            Some(Err(e)) => {
+                                eprintln!("[client] ws error: {:?} — reconnecting...", e);
+                                break;
+                            }
+                            None => {
+                                println!("[client] connection dropped — reconnecting...");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.is_connected.store(false, Ordering::Relaxed);
+            attempt += 1;
+        }
+    }
+
+    /// Call a remote function on another service.
+    /// Returns Ok(Value) on success or Err(Value) if the callee returned an error.
+    pub async fn call(
+        &self,
+        function: &str,
+        target_channel:String,
+        args: Value,
+        kwargs: Value,
+    ) -> Result<Value, Value> {
+        let correlation_id = format!("corr-{}", uuid());
+        let reply_to = self.channel.clone();
+
+        let mut kw = kwargs.as_object().cloned().unwrap_or_default();
+        kw.insert("function".to_string(), Value::String(function.to_string()));
+        kw.insert("correlation_id".to_string(), Value::String(correlation_id.clone()));
+        kw.insert("reply_to".to_string(), Value::String(reply_to.clone()));
+
+        let publish = WampPublish {
+            message_type: 16,
+            request_id: rand_u64(),
+            options: WampPublishOptions {
+                acknowledge: false,
+                correlation_id: Some(correlation_id.clone()),
+                reply_to: Some(reply_to),
+            },
+            topic: target_channel,
+            args: Some(args),
+            kwargs: Some(Value::Object(kw)),
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .await
+            .insert(correlation_id.clone(), tx);
+
+        println!(
+            "[client] → CALL fn='{}' corr={} target='{}'",
+            function, correlation_id, publish.topic
+        );
+
+        {
+            let guard = self.publish_tx.lock().await;
+            let tx = guard
+                .as_ref()
+                .ok_or_else(|| serde_json::json!({"error": "not connected — call listen() first"}))?;
+            tx.send(publish).await
+                .map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+        }
+
+        match tokio::time::timeout(tokio::time::Duration::from_secs(30), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(serde_json::json!({"error": "reply channel dropped"})),
+            Err(_) => {
+                self.pending.lock().await.remove(&correlation_id);
+                Err(serde_json::json!({"error": "call timed out"}))
+            }
+        }
+    }
+
+    // ── internal message dispatcher ───────────────────────────────────────────
+
+    async fn handle_message(
+        &self,
+        text: &str,
+        ws_stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        if let Ok(err) = serde_json::from_str::<BrokerError>(text) {
+            if err.message_type == 0 {
+                println!(
+                    "[client] ← BROKER ERROR: {} corr={:?}",
+                    err.error, err.correlation_id
+                );
+                if let Some(corr_id) = &err.correlation_id {
+                    if let Some(tx) = self.pending.lock().await.remove(corr_id) {
+                        let _ = tx.send(Err(serde_json::json!({"error": err.error})));
+                    }
+                }
+                return;
+            }
+        }
+
+        if let Ok(event) = serde_json::from_str::<WampEvent>(text) {
+            let corr_id = event.details.correlation_id.clone();
+            let reply_to = event.details.reply_to.clone();
+            let function = event.kwargs
+                .as_ref()
+                .and_then(|kw| kw.get("function"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            match function {
+                Some(fn_name) => {
+                    self.dispatch_rpc(
+                        fn_name,
+                        event.args.clone(),
+                        event.kwargs.clone(),
+                        corr_id,
+                        reply_to,
+                        ws_stream,
+                    )
+                    .await;
+                }
+                None => {
+                    if let Some(ref cid) = corr_id {
+                        if let Some(tx) = self.pending.lock().await.remove(cid) {
+                            // check is_error flag to decide Ok vs Err
+                            let is_error = event.kwargs
+                                .as_ref()
+                                .and_then(|kw| kw.get("is_error"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+
+                            let payload = event.kwargs
+                                .or(event.args)
+                                .unwrap_or(Value::Null);
+
+                            if is_error {
+                                let _ = tx.send(Err(payload));
+                            } else {
+                                let _ = tx.send(Ok(payload));
+                            }
+                        }
+                    } else {
+                        println!("[client] ← EVENT {}", text);
+                    }
+                }
+            }
+            return;
+        }
+
+        println!("[client] ← UNKNOWN {}", text);
+    }
+
+    async fn dispatch_rpc(
+        &self,
+        function: String,
+        args: Option<Value>,
+        kwargs: Option<Value>,
+        correlation_id: Option<String>,
+        reply_to: Option<String>,
+        ws_stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        let handler = self.handlers.lock().await.get(&function).cloned();
+
+        match handler {
+            None => {
+                eprintln!("[client] no handler registered for '{}'", function);
+                if let (Some(corr_id), Some(rt)) = (correlation_id, reply_to) {
+                    let reply = make_reply(
+                        &self.channel,
+                        &rt,
+                        &corr_id,
+                        serde_json::json!({"error": format!("no handler for '{}'", function)}),
+                        true,
+                    );
+                    let _ = ws_stream
+                        .send(Message::Text(serde_json::to_string(&reply).unwrap().into()))
+                        .await;
+                }
+            }
+            Some(h) => {
+                println!("[client] ← CALL fn='{}' corr={:?}", function, correlation_id);
+                
+                // spawn handler so it doesn't block the select loop
+                let channel = self.channel.clone();
+                let publish_tx = self.publish_tx.clone();
+                
+                tokio::spawn(async move {
+                    let result = h(args, kwargs).await;
+
+                    if let (Some(corr_id), Some(rt)) = (correlation_id, reply_to) {
+                        let (payload, is_error) = match result {
+                            Ok(v) => (v, false),
+                            Err(e) => (e, true),
+                        };
+                        let reply = make_reply(&channel, &rt, &corr_id, payload, is_error);
+                        let msg = serde_json::to_string(&reply).unwrap();
+                        println!("[client] → REPLY fn='{}' corr={} is_error={}", function, corr_id, is_error);
+
+                        // send reply via publish channel instead of ws_stream directly
+                        if let Ok(guard) = publish_tx.try_lock() {
+                            if let Some(tx) = guard.as_ref() {
+                                let _ = tx.send(reply).await;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+const PING_INTERVAL_SECS: u64 = 15;
+const PING_TIMEOUT_SECS: u64 = 10;
+
+fn make_reply(
+    _my_channel: &str,
+    reply_to: &str,
+    correlation_id: &str,
+    payload: Value,
+    is_error: bool,
+) -> WampPublish {
+    let mut kw = serde_json::Map::new();
+    kw.insert("is_result".to_string(), Value::Bool(true));
+    kw.insert(
+        "correlation_id".to_string(),
+        Value::String(correlation_id.to_string()),
+    );
+    if is_error {
+        kw.insert("is_error".to_string(), Value::Bool(true));
+    }
+
+    WampPublish {
+        message_type: 16,
+        request_id: rand_u64(),
+        options: WampPublishOptions {
+            acknowledge: false,
+            correlation_id: Some(correlation_id.to_string()),
+            reply_to: None,
+        },
+        topic: reply_to.to_string(),
+        args: None,
+        kwargs: Some(Value::Object(
+            kw.into_iter()
+                .chain(
+                    payload
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter(),
+                )
+                .collect(),
+        )),
+    }
+}
+
+fn rand_u64() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() as u64
+}
+
+fn uuid() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
+
+#[macro_export]
+macro_rules! wamp_args {
+    ($args:expr) => {
+        $args
+            .as_ref()
+            .and_then(|a| a.get(0))
+            .ok_or_else(|| serde_json::json!({"error": "missing args"}))
+            .and_then(|v| {
+                serde_json::from_value(v.clone())
+                    .map_err(|e| serde_json::json!({"error": format!("invalid args: {}", e)}))
+            })
+    };
+}
+

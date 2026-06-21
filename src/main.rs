@@ -44,6 +44,10 @@ enum Commands {
         /// Unique device identifier
         #[arg(long)]
         device_id: String,
+        /// Comma-separated list of capabilities this device supports
+        /// (e.g. "osx,osxarm64,osxamd64"). Defaults to "unix" if omitted.
+        #[arg(long)]
+        capabilities: Option<String>,
     },
     /// Load SQL fixtures into database pods
     LoadFixtures,
@@ -126,12 +130,23 @@ async fn check_session_gurad(
                         .await
                 }
                 Commands::Deploy => todo!(),
-                Commands::Start {device_id}=> {
+                Commands::Start {device_id, capabilities}=> {
+
+                    let capabilities: Vec<String> = capabilities
+                        .as_deref()
+                        .map(|csv| {
+                            csv.split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| vec!["unix".to_string()]);
 
                     match identity_validate_api_token(&iam_config).await {
                         Ok(response) => {
 
-                            start::main(token.clone(), response, &metadata_config, device_id).await;
+                            start::main(token.clone(), response, &metadata_config, device_id, capabilities).await;
                         }
                         Err(error) => {
                             println!("Token validation failed: {:?}", error);

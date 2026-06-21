@@ -1,5 +1,7 @@
+use GingerPresence::{apis::default_api::routes_index, get_configuration};
 use IAMService::models::ValidateApiTokenResponse;
 use MetadataService::apis::{configuration::Configuration as MetadataConfiguration, default_api::{MetadataGetPackageVersionPlainTextParams, metadata_get_package_version_plain_text}};
+use ginger_shared_rs::utils::get_token_from_file_storage;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -56,7 +58,13 @@ struct DeleteGatewayArgs {
 }
 
 
-pub async fn main(access_token: String, token_response: ValidateApiTokenResponse, metadata_config: &MetadataConfiguration, device_id: String) {
+pub async fn main(
+    access_token: String,
+    token_response: ValidateApiTokenResponse,
+    metadata_config: &MetadataConfiguration,
+    device_id: String,
+    capabilities: Vec<String>,
+) {
     let client = Arc::new(WampClient::new(
         &format!("{}.ginger_infra", device_id),
         &access_token,
@@ -456,18 +464,55 @@ pub async fn main(access_token: String, token_response: ValidateApiTokenResponse
         }
     }).await;
 
+
+    let token = get_token_from_file_storage();
+
+    let presence_config = get_configuration(Some(token));
+
+    // resp.message is the presence-service channel this device should
+    // heartbeat against — e.g. "presence-<instance_id>_rackmint"
+    let device_channel = match routes_index(&presence_config).await {
+        Ok(resp) => {
+            println!("{:?}", resp.message);
+            resp.message
+        }
+        Err(e) => {
+            eprintln!("[start] failed to fetch presence channel: {:?}", e);
+            String::new()
+        }
+    };
+
+
     // spawn heartbeat as a separate task — nothing to do with WampClient internals
     let heartbeat_client = Arc::clone(&client);
-    let heartbeat_topic = format!("heartbeat.{}.ginger_infra_{}", device_id, token_response.sub);
+    let heartbeat_capabilities = capabilities.clone();
+    // this device's own channel — "who am I" — independent of where the
+    // RPC is being sent (the presence-service channel, below)
+    let own_channel = client.channel().to_string();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
         interval.tick().await; // discard immediate tick
         loop {
             interval.tick().await;
-            if heartbeat_client.is_connected() {
-                let stats = crate::heartbeat::collect_stats();
-                if let Err(e) = heartbeat_client.publish(&heartbeat_topic, stats).await {
-                    eprintln!("[heartbeat] publish failed: {}", e);
+            if heartbeat_client.is_connected() && !device_channel.is_empty() {
+                // system stats collection is wired up but not sent yet —
+                // will be included in the heartbeat payload in a future change
+                let _stats = crate::heartbeat::collect_stats();
+
+                let result = heartbeat_client
+                    .call(
+                        "handle_heartbeat",       
+                        device_channel.clone(),  
+                        json!([]),
+                        json!({
+                            "device_channel": own_channel,
+                            "capabilities": heartbeat_capabilities,
+                        }),
+                    )
+                    .await;
+
+                if let Err(e) = result {
+                    eprintln!("[heartbeat] handle_heartbeat call failed: {:?}", e);
                 }
             }
         }

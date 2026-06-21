@@ -1,6 +1,7 @@
 /target
 IAMService_client
 MetadataService_client
+GingerPresence_client
 .ginger.tmp
 .DS_Store
 bin
