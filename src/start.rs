@@ -486,33 +486,70 @@ pub async fn main(
     // spawn heartbeat as a separate task — nothing to do with WampClient internals
     let heartbeat_client = Arc::clone(&client);
     let heartbeat_capabilities = capabilities.clone();
-    // this device's own channel — "who am I" — independent of where the
-    // RPC is being sent (the presence-service channel, below)
     let own_channel = client.channel().to_string();
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-        interval.tick().await; // discard immediate tick
+        interval.tick().await;
+
+        let mut current_device_channel = device_channel.clone();
+        let mut consecutive_failures: u32 = 0;
+
         loop {
             interval.tick().await;
-            if heartbeat_client.is_connected() && !device_channel.is_empty() {
-                // system stats collection is wired up but not sent yet —
-                // will be included in the heartbeat payload in a future change
-                let _stats = crate::heartbeat::collect_stats();
 
-                let result = heartbeat_client
-                    .call(
-                        "handle_heartbeat",       
-                        device_channel.clone(),  
-                        json!([]),
-                        json!({
-                            "device_channel": own_channel,
-                            "capabilities": heartbeat_capabilities,
-                        }),
-                    )
-                    .await;
+            if consecutive_failures >= 3 {
+                eprintln!("[heartbeat] {} consecutive failures — re-fetching presence channel...", consecutive_failures);
+                let token = get_token_from_file_storage();
+                let presence_config = get_configuration(Some(token));
+                match routes_index(&presence_config).await {
+                    Ok(resp) => {
+                        let new_channel = resp.message;
+                        if new_channel != current_device_channel {
+                            println!("[heartbeat] presence channel changed: {} → {}", current_device_channel, new_channel);
+                            current_device_channel = new_channel;
+                        } else {
+                            println!("[heartbeat] presence channel unchanged: {}", current_device_channel);
+                        }
+                        consecutive_failures = 0;
+                    }
+                    Err(e) => {
+                        eprintln!("[heartbeat] failed to re-fetch presence channel: {:?}", e);
+                        // presence HTTP is down too — don't reset, don't call dead channel
+                        // just wait for next interval and try re-fetch again
+                        continue; // ← skip the call below entirely
+                    }
+                }
+            }
 
-                if let Err(e) = result {
-                    eprintln!("[heartbeat] handle_heartbeat call failed: {:?}", e);
+            if !heartbeat_client.is_connected() || current_device_channel.is_empty() {
+                continue;
+            }
+
+            let _stats = crate::heartbeat::collect_stats();
+
+            let result = heartbeat_client
+                .call(
+                    "handle_heartbeat",
+                    current_device_channel.clone(),
+                    json!([]),
+                    json!({
+                        "device_channel": own_channel,
+                        "capabilities": heartbeat_capabilities,
+                    }),
+                )
+                .await;
+
+            match result {
+                Ok(_) => {
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    eprintln!(
+                        "[heartbeat] handle_heartbeat call failed ({}/3): {:?}",
+                        consecutive_failures, e
+                    );
                 }
             }
         }
