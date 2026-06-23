@@ -7,7 +7,7 @@ default-run = "ginger-infra"
 
 [[bin]]
 name = "remote-task-controller"
-path = "src/bin/remote-task-controller.rs"
+path = "src/bin/remote-task-controller/main.rs"
 
 [package.metadata]
 organization = "ginger-society"

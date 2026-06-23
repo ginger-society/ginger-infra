@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
-    api::{Api, Patch, PatchParams},
+    api::{Api, DynamicObject, Patch, PatchParams},
+    discovery::ApiResource,
     runtime::{controller::Action, watcher, Controller},
     Client, ResourceExt,
 };
@@ -12,6 +14,15 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use ginger_infra::remote_task::{RemoteTask, RemoteTaskCondition, RemoteTaskPhase, RemoteTaskStatus};
+
+mod customrun;
+mod events;
+
+use customrun::{
+    customrun_error_policy, reconcile_customrun, CustomRunContext, CUSTOMRUN_GROUP,
+    CUSTOMRUN_KIND, CUSTOMRUN_PLURAL, CUSTOMRUN_VERSION,
+};
+use events::emit_event;
 
 const REQUEUE_AFTER_ERROR_SECS: u64 = 30;
 
@@ -49,25 +60,53 @@ async fn main() -> anyhow::Result<()> {
     println!("[tekton-controller] sidekick_url={}", sidekick_url);
 
     let client = Client::try_default().await?;
-    let remote_tasks: Api<RemoteTask> = Api::all(client.clone());
 
+    let remote_tasks: Api<RemoteTask> = Api::all(client.clone());
     let ctx = Arc::new(ControllerContext {
         client: client.clone(),
         http: reqwest::Client::new(),
         sidekick_url,
     });
 
-    println!("[tekton-controller] watching RemoteTask across all namespaces");
+    // Second watch: Tekton CustomRun objects (tekton.dev/v1beta1), filtered
+    // inside reconcile_customrun to only act on ones whose customRef targets
+    // our RemoteTask GVK. DynamicObject since we don't own this CRD and no
+    // Rust crate ships its types.
+    let customrun_ar = ApiResource {
+        group: CUSTOMRUN_GROUP.to_string(),
+        version: CUSTOMRUN_VERSION.to_string(),
+        api_version: format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}"),
+        kind: CUSTOMRUN_KIND.to_string(),
+        plural: CUSTOMRUN_PLURAL.to_string(),
+    };
+    let customruns: Api<DynamicObject> = Api::all_with(client.clone(), &customrun_ar);
+    let customrun_ctx = Arc::new(CustomRunContext {
+        client: client.clone(),
+    });
 
-    Controller::new(remote_tasks, watcher::Config::default())
+    println!("[tekton-controller] watching RemoteTask across all namespaces");
+    println!("[tekton-controller] watching CustomRun (tekton.dev/v1beta1) across all namespaces");
+
+    let remote_task_controller = Controller::new(remote_tasks, watcher::Config::default())
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
             match res {
-                Ok(o) => println!("[tekton-controller] reconciled {:?}", o),
-                Err(e) => eprintln!("[tekton-controller] reconcile error: {:?}", e),
+                Ok(o) => println!("[tekton-controller] reconciled remotetask {:?}", o),
+                Err(e) => eprintln!("[tekton-controller] remotetask reconcile error: {:?}", e),
             }
-        })
-        .await;
+        });
+
+    let customrun_controller = Controller::new_with(customruns, watcher::Config::default(), customrun_ar)
+        .run(reconcile_customrun, customrun_error_policy, customrun_ctx)
+        .for_each(|res| async move {
+            match res {
+                Ok(o) => println!("[tekton-controller] reconciled customrun {:?}", o),
+                Err(e) => eprintln!("[tekton-controller] customrun reconcile error: {:?}", e),
+            }
+        });
+
+    // Run both controllers concurrently in the same process.
+    tokio::join!(remote_task_controller, customrun_controller);
 
     Ok(())
 }
@@ -128,7 +167,8 @@ async fn dispatch(
         env: env_map.into_iter().map(|(name, value)| EnvVar { name, value }).collect(),
     };
 
-    let result = stream_job(&ctx.http, &ctx.sidekick_url, &request).await;
+    let task_ref = object_ref_for_task(task, ns, name);
+    let result = stream_job(&ctx.client, &ctx.http, &ctx.sidekick_url, &request, ns, &task_ref).await;
 
     let final_status = match result {
         Ok(exit_code) => RemoteTaskStatus {
@@ -220,6 +260,17 @@ fn now() -> Time {
     Time(k8s_openapi::jiff::Timestamp::now())
 }
 
+fn object_ref_for_task(task: &RemoteTask, ns: &str, name: &str) -> ObjectReference {
+    ObjectReference {
+        api_version: Some("gingersociety.org/v1alpha1".to_string()),
+        kind: Some("RemoteTask".to_string()),
+        name: Some(name.to_string()),
+        namespace: Some(ns.to_string()),
+        uid: task.uid(),
+        ..Default::default()
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct EnvVar {
     name: String,
@@ -236,11 +287,14 @@ struct RunJobRequest {
 }
 
 async fn stream_job(
-    client: &reqwest::Client,
+    client: &Client,
+    http: &reqwest::Client,
     url: &str,
     request: &RunJobRequest,
+    ns: &str,
+    task_ref: &ObjectReference,
 ) -> Result<i32, ReconcileError> {
-    let response = client
+    let response = http
         .post(url)
         .header("Content-Type", "application/json")
         .json(request)
@@ -291,6 +345,31 @@ async fn stream_job(
                     let stream_name = event.get("stream").and_then(|v| v.as_str()).unwrap_or("stdout");
                     let line_text = event.get("line").and_then(|v| v.as_str()).unwrap_or("");
                     println!("[remote-task:{stream_name}] {line_text}");
+
+                    // Mirror the log line onto the RemoteTask (and therefore
+                    // anything watching it, e.g. an owning CustomRun) as a
+                    // real k8s Event. This is what lets `tkn pr logs` / the
+                    // Tekton dashboard show progress for a CustomRun-backed
+                    // step even though no pod ever runs for it.
+                    //
+                    // NOTE: this is necessarily noisy (one Event per log
+                    // line) and Events are not designed as a high-volume log
+                    // transport — if your scripts produce a lot of output,
+                    // consider batching N lines per Event or only emitting
+                    // every Kth line, and/or rely on this for "is it still
+                    // alive" signal rather than a full log tail.
+                    if let Err(e) = emit_event(
+                        client,
+                        ns,
+                        task_ref,
+                        "Normal",
+                        "RemoteTaskLog",
+                        &format!("[{stream_name}] {line_text}"),
+                    )
+                    .await
+                    {
+                        eprintln!("[tekton-controller] failed to emit log event: {e}");
+                    }
                 }
                 "done" => {
                     let exit_code = event.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0) as i32;

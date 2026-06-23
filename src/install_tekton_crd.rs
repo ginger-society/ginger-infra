@@ -81,7 +81,7 @@ metadata:
 rules:
   - apiGroups: ["gingersociety.org"]
     resources: ["remotetasks"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+    verbs: ["get", "list", "watch", "update", "patch", "create"]
   - apiGroups: ["gingersociety.org"]
     resources: ["remotetasks/status"]
     verbs: ["get", "update", "patch"]
@@ -91,6 +91,12 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  - apiGroups: ["tekton.dev"]
+    resources: ["customruns"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["tekton.dev"]
+    resources: ["customruns/status"]
+    verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
