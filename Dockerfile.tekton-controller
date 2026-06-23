@@ -15,7 +15,6 @@ COPY . .
 RUN ginger-auth token-login $GINGER_TOKEN
 RUN ginger-connector connect prod
 
-RUN touch src/main.rs src/lib.rs src/remote_task.rs src/bin/tekton-controller.rs
 RUN cargo build --release --bin remote-task-controller
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
