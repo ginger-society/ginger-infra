@@ -4,6 +4,7 @@ MetadataService_client
 GingerPresence_client
 .ginger.tmp
 .DS_Store
-bin
+bin/**/ginger-infra
+bin/**/ginger-infra.exe
 catter.sh
 combined_output.txt
