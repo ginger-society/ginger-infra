@@ -20,7 +20,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
 
-const DEFAULT_EXECUTOR_URL: &str = "http://0.0.0.0:8099/run-job";
+const DEFAULT_EXECUTOR_URL: &str = "https://api.gingersociety.org/external-executor/run-job";
 
 #[derive(Debug, Serialize)]
 struct EnvVar {
