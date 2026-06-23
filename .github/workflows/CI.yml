@@ -14,17 +14,21 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v3
 
-    # - name: Install ginger-apps
-    #   run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/rust-helpers/install-pipeline-clis.sh)"
+    - name: Install ginger-apps
+      run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/rust-helpers/install-pipeline-clis.sh)"
 
+    - name: Authenticate with ginger-auth
+      id: ginger-auth
+      run: ginger-auth token-login ${{ secrets.GINGER_TOKEN }}
+
+    - name: connect to prod schema service
+      run : ginger-connector connect prod
 
     - name: Log in to Docker Hub
       run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
       continue-on-error: false
 
-    # - name: Authenticate with ginger-auth
-    #   id: ginger-auth
-    #   run: ginger-auth token-login ${{ secrets.GINGER_TOKEN }}
+    
 
     # - name: Update pipeline to running
     #   run: ginger-connector update-pipeline stage running
