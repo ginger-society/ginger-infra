@@ -1,0 +1,31 @@
+# ── Stage 1: build ────────────────────────────────────────────────────────────
+# Changed from bullseye to bookworm
+FROM rust:1-slim-bookworm AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+RUN touch src/main.rs src/lib.rs src/remote_task.rs src/bin/tekton-controller.rs
+RUN cargo build --release --bin remote-task-controller
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+# Added libssl3 to match the builder's OpenSSL version
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin controller
+
+COPY --from=builder /build/target/release/remote-task-controller /usr/local/bin/remote-task-controller
+
+USER 10001
+
+ENTRYPOINT ["/usr/local/bin/remote-task-controller"]

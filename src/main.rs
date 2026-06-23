@@ -23,6 +23,9 @@ mod verbose_replace;
 mod install_helm_charts;
 mod rpc;
 
+mod install_tekton_crd;
+use ginger_infra::remote_task::RemoteTask;
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize a infra project
@@ -76,6 +79,14 @@ enum Commands {
         #[arg(long, default_value = "unix")]
         capability: String,
     },
+    InstallTektonCrd {
+        /// Controller image to deploy (default: gingersociety/remote-task-controller:latest)
+        #[arg(long)]
+        image: Option<String>,
+        /// Default sidekick URL to bake into the controller Deployment's env
+        #[arg(long)]
+        sidekick_url: Option<String>,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -100,6 +111,15 @@ async fn check_session_gurad(
 ) {
     
             match cli.command {
+                Commands::InstallTektonCrd { image, sidekick_url } => {
+                    if let Err(e) = install_tekton_crd::run_install_tekton_crd(
+                        image.as_deref(),
+                        sidekick_url.as_deref(),
+                    ) {
+                        eprintln!("install-tekton-crd failed: {e}");
+                        std::process::exit(1);
+                    }
+                },
                 Commands::Rpc { envrc, script, cleanup, capability } => {
                     rpc::run_rpc(&envrc, &script, cleanup.as_deref(), &capability).await;
                 }

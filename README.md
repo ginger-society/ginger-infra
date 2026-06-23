@@ -414,3 +414,19 @@ spec:
 | Device OS | The actual execution environment — bare metal, no containerisation |
 
 Nothing fighting anything else. Each layer does exactly one thing.
+
+
+
+# one-time, against whichever cluster KUBECONFIG points at:
+ginger-infra install-tekton-crd \
+  --image gingersociety/remote-task-controller:latest \
+  --sidekick-url http://tekton-sidekick.infra.svc.cluster.local:8099/run-job
+
+# verify:
+kubectl get crd remotetasks.gingersociety.org
+kubectl -n tekton-pipelines get deployment remote-task-controller
+kubectl -n tekton-pipelines logs deploy/remote-task-controller -f
+
+# then apply a RemoteTask and watch it:
+kubectl apply -f my-remote-task.yaml
+kubectl get remotetasks -A -w

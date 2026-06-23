@@ -3,6 +3,11 @@ description = "Infra related commands"
 edition = "2021"
 name = "ginger-infra"
 version = "0.6.0-nightly.0"
+default-run = "ginger-infra"
+
+[[bin]]
+name = "remote-task-controller"
+path = "src/bin/tekton-controller.rs"
 
 [package.metadata]
 organization = "ginger-society"
@@ -28,4 +33,9 @@ base64 = "0.22"
 toml = "0.8"
 libc = "0.2.186"
 reqwest = { version = "0.12", features = ["json", "stream"] }
-
+kube = { version = "3.1.0", features = ["runtime", "derive", "client", "ws"] }
+k8s-openapi = { version = "0.27.0", features = ["latest", "schemars"] }
+schemars = { version = "1" }
+serde_yaml = "0.9"      # for rendering the generated CRD struct to YAML
+thiserror = "1"         # for the controller's ReconcileError enum
+chrono = "0.4"          # for RemoteTaskStatus timestamps (k8s_openapi::Time wraps chrono::DateTime<Utc>)

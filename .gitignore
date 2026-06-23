@@ -5,3 +5,5 @@ GingerPresence_client
 .ginger.tmp
 .DS_Store
 bin
+catter.sh
+combined_output.txt
