@@ -149,6 +149,21 @@ async fn dispatch(
 
     let env_map = resolve_env(&ctx.client, ns, &task.spec.env).await?;
 
+    // ── find owning CustomRun (if this RemoteTask was created by our customrun controller)
+    let customrun_ref: Option<ObjectReference> = task
+        .metadata
+        .owner_references
+        .as_ref()
+        .and_then(|owners| owners.iter().find(|o| o.kind == "CustomRun"))
+        .map(|owner| ObjectReference {
+            api_version: Some(owner.api_version.clone()),
+            kind: Some(owner.kind.clone()),
+            name: Some(owner.name.clone()),
+            namespace: Some(ns.to_string()),
+            uid: Some(owner.uid.clone()),
+            ..Default::default()
+        });
+
     set_status(
         &api,
         name,
@@ -168,7 +183,15 @@ async fn dispatch(
     };
 
     let task_ref = object_ref_for_task(task, ns, name);
-    let result = stream_job(&ctx.client, &ctx.http, &ctx.sidekick_url, &request, ns, &task_ref).await;
+    let result = stream_job(
+        &ctx.client,
+        &ctx.http,
+        &ctx.sidekick_url,
+        &request,
+        ns,
+        &task_ref,
+        customrun_ref.as_ref(), // ← new
+    ).await;
 
     let final_status = match result {
         Ok(exit_code) => RemoteTaskStatus {
@@ -199,6 +222,109 @@ async fn dispatch(
 
     set_status(&api, name, final_status).await?;
     Ok(())
+}
+
+async fn stream_job(
+    client: &Client,
+    http: &reqwest::Client,
+    url: &str,
+    request: &RunJobRequest,
+    ns: &str,
+    task_ref: &ObjectReference,
+    customrun_ref: Option<&ObjectReference>, // ← new
+) -> Result<i32, ReconcileError> {
+    let response = http
+        .post(url)
+        .header("Content-Type", "application/json")
+        .json(request)
+        .send()
+        .await
+        .map_err(|e| ReconcileError::SidekickRequest(format!("request to '{url}' failed: {e}")))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(ReconcileError::SidekickRequest(format!(
+            "sidekick returned {status}: {body}"
+        )));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buf = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|e| ReconcileError::SidekickRequest(format!("stream read error: {e}")))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(idx) = buf.find('\n') {
+            let line = buf[..idx].trim_end_matches('\r').to_string();
+            buf.drain(..=idx);
+
+            if line.is_empty() {
+                continue;
+            }
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim_start();
+
+            let event: Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[tekton-controller] could not parse event '{data}': {e}");
+                    continue;
+                }
+            };
+
+            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+            match event_type {
+                "log" => {
+                    let stream_name = event.get("stream").and_then(|v| v.as_str()).unwrap_or("stdout");
+                    let line_text = event.get("line").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("[remote-task:{stream_name}] {line_text}");
+
+                    let message = format!("[{stream_name}] {line_text}");
+
+                    // emit on RemoteTask (existing behaviour)
+                    if let Err(e) = emit_event(
+                        client, ns, task_ref, "Normal", "RemoteTaskLog", &message,
+                    ).await {
+                        eprintln!("[tekton-controller] failed to emit log event on remotetask: {e}");
+                    }
+
+                    // ── also emit on the owning CustomRun so the Tekton dashboard
+                    //    Events tab and `tkn pr logs` can surface the output
+                    if let Some(cr_ref) = customrun_ref {
+                        if let Err(e) = emit_event(
+                            client, ns, cr_ref, "Normal", "RemoteTaskLog", &message,
+                        ).await {
+                            eprintln!("[tekton-controller] failed to emit log event on customrun: {e}");
+                        }
+                    }
+                }
+                "done" => {
+                    let exit_code = event.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    return Ok(exit_code);
+                }
+                "error" => {
+                    let message = event
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    return Err(ReconcileError::JobError(message.to_string()));
+                }
+                _ => {
+                    println!("[tekton-controller] unrecognized event: {data}");
+                }
+            }
+        }
+    }
+
+    Err(ReconcileError::JobError(
+        "stream ended before a 'done' or 'error' event was received".to_string(),
+    ))
 }
 
 async fn resolve_env(
@@ -286,110 +412,3 @@ struct RunJobRequest {
     env: Vec<EnvVar>,
 }
 
-async fn stream_job(
-    client: &Client,
-    http: &reqwest::Client,
-    url: &str,
-    request: &RunJobRequest,
-    ns: &str,
-    task_ref: &ObjectReference,
-) -> Result<i32, ReconcileError> {
-    let response = http
-        .post(url)
-        .header("Content-Type", "application/json")
-        .json(request)
-        .send()
-        .await
-        .map_err(|e| ReconcileError::SidekickRequest(format!("request to '{url}' failed: {e}")))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(ReconcileError::SidekickRequest(format!(
-            "sidekick returned {status}: {body}"
-        )));
-    }
-
-    let mut stream = response.bytes_stream();
-    let mut buf = String::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|e| ReconcileError::SidekickRequest(format!("stream read error: {e}")))?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(idx) = buf.find('\n') {
-            let line = buf[..idx].trim_end_matches('\r').to_string();
-            buf.drain(..=idx);
-
-            if line.is_empty() {
-                continue;
-            }
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let data = data.trim_start();
-
-            let event: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("[tekton-controller] could not parse event '{data}': {e}");
-                    continue;
-                }
-            };
-
-            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-            match event_type {
-                "log" => {
-                    let stream_name = event.get("stream").and_then(|v| v.as_str()).unwrap_or("stdout");
-                    let line_text = event.get("line").and_then(|v| v.as_str()).unwrap_or("");
-                    println!("[remote-task:{stream_name}] {line_text}");
-
-                    // Mirror the log line onto the RemoteTask (and therefore
-                    // anything watching it, e.g. an owning CustomRun) as a
-                    // real k8s Event. This is what lets `tkn pr logs` / the
-                    // Tekton dashboard show progress for a CustomRun-backed
-                    // step even though no pod ever runs for it.
-                    //
-                    // NOTE: this is necessarily noisy (one Event per log
-                    // line) and Events are not designed as a high-volume log
-                    // transport — if your scripts produce a lot of output,
-                    // consider batching N lines per Event or only emitting
-                    // every Kth line, and/or rely on this for "is it still
-                    // alive" signal rather than a full log tail.
-                    if let Err(e) = emit_event(
-                        client,
-                        ns,
-                        task_ref,
-                        "Normal",
-                        "RemoteTaskLog",
-                        &format!("[{stream_name}] {line_text}"),
-                    )
-                    .await
-                    {
-                        eprintln!("[tekton-controller] failed to emit log event: {e}");
-                    }
-                }
-                "done" => {
-                    let exit_code = event.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                    return Ok(exit_code);
-                }
-                "error" => {
-                    let message = event
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error");
-                    return Err(ReconcileError::JobError(message.to_string()));
-                }
-                _ => {
-                    println!("[tekton-controller] unrecognized event: {data}");
-                }
-            }
-        }
-    }
-
-    Err(ReconcileError::JobError(
-        "stream ended before a 'done' or 'error' event was received".to_string(),
-    ))
-}
