@@ -1,7 +1,6 @@
 # First stage: Build the Rust application
 FROM rust:1-slim-bullseye
 RUN apt-get update && apt-get install -y pkg-config libssl-dev libpq-dev curl
-
 # Install Node.js
 RUN curl -fsSL https://deb.nodesource.com/setup_current.x | bash -
 RUN apt install -y nodejs

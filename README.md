@@ -430,3 +430,23 @@ kubectl -n tekton-pipelines logs deploy/remote-task-controller -f
 # then apply a RemoteTask and watch it:
 kubectl apply -f my-remote-task.yaml
 kubectl get remotetasks -A -w
+
+
+kubectl patch deployment remote-task-controller -n tekton-pipelines --type='json' -p='[
+  {
+    "op": "add",
+    "path": "/spec/template/spec/securityContext",
+    "value": {
+      "runAsNonRoot": true,
+      "seccompProfile": { "type": "RuntimeDefault" }
+    }
+  },
+  {
+    "op": "add",
+    "path": "/spec/template/spec/containers/0/securityContext",
+    "value": {
+      "allowPrivilegeEscalation": false,
+      "capabilities": { "drop": ["ALL"] }
+    }
+  }
+]'
