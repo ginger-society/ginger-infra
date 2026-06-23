@@ -1,38 +1,11 @@
 //! Bridges Tekton `CustomRun` (tekton.dev/v1beta1) objects whose `customRef`
 //! points at `gingersociety.org/v1alpha1, Kind=RemoteTask` to the existing
 //! RemoteTask CRD + controller, with no pod involved on the Tekton side.
-//!
-//! Flow:
-//!   1. A PipelineRun's PipelineTask sets `taskRef.apiVersion` + `taskRef.kind`
-//!      (instead of `taskRef.name`), so Tekton creates a `CustomRun` instead
-//!      of a `TaskRun`/pod.
-//!   2. We reconcile that CustomRun here: parse its `spec.params` into a
-//!      `RemoteTaskSpec`, then create a `RemoteTask` (owned by the CustomRun)
-//!      with that spec — same struct the existing reconciler already knows
-//!      how to dispatch to sidekick.
-//!   3. While the owned RemoteTask is Pending/Running, we keep CustomRun's
-//!      `Succeeded` condition at `status: "Unknown"` — Tekton's signal to
-//!      keep watching rather than treat the step as finished. Each `log`
-//!      event the `stream_job` loop in main.rs sees is also emitted as a
-//!      Kubernetes `Event` on the RemoteTask (via `emit_event`, see
-//!      events.rs), which `tkn pr logs` / the dashboard pick up even with
-//!      no pod.
-//!   4. On RemoteTask terminal phase, we patch CustomRun.status to
-//!      True/False and copy the exit code into `status.results`.
-//!
-//! IMPORTANT — integration notes:
-//!   - There is no published Rust crate with native Tekton `CustomRun` types,
-//!     so this file defines minimal wire structs (`CustomRunSpec`, `Param`,
-//!     etc.) for just the fields we read/write, and drives the actual object
-//!     through `kube::api::DynamicObject` + `kube::discovery::ApiResource`.
-//!   - This file assumes `kube = "3.1.0"` / `k8s-openapi = "0.27.0"` (the
-//!     jiff-based `Time`), matching the existing `remote-task-controller`
-//!     binary's use of `k8s_openapi::jiff::Timestamp`. NOT compiled against
-//!     the real workspace — see the integration notes in chat before building.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::ObjectReference;
+use k8s_openapi::api::core::v1::{Container, EnvVar as K8sEnvVar, ObjectReference, Pod, PodSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 use kube::{
     api::{Api, DynamicObject, Patch, PatchParams, PostParams},
@@ -76,13 +49,6 @@ pub struct CustomRunContext {
     pub client: Client,
 }
 
-// ---- minimal CustomRun wire types ------------------------------------------
-//
-// We only need spec.customRef, spec.params, and the ability to write
-// status.conditions / status.results, so plain serde structs read off a
-// DynamicObject's `data` field are enough — no need for a full Tekton types
-// crate (none exists for Rust).
-
 #[derive(Debug, Deserialize)]
 struct CustomRunSpec {
     #[serde(rename = "customRef")]
@@ -104,9 +70,6 @@ struct Param {
     value: ParamValue,
 }
 
-/// Tekton's ParamValue can be a bare string or an array of strings.
-/// We only ever produce/consume strings here (the `env` param is a YAML
-/// blob string we parse ourselves), so Array just falls back to None.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ParamValue {
@@ -127,7 +90,7 @@ impl ParamValue {
 struct CustomRunCondition {
     #[serde(rename = "type")]
     type_: String,
-    status: String, // "True" | "False" | "Unknown"
+    status: String,
     reason: String,
     message: String,
     #[serde(rename = "lastTransitionTime", skip_serializing_if = "Option::is_none")]
@@ -142,9 +105,6 @@ struct CustomRunResult {
 
 // ---- param parsing ----------------------------------------------------
 
-/// Pulls `capability`, `script`, `cleanup`, and `env` params out of a
-/// CustomRun and builds the same `RemoteTaskSpec` a developer would have
-/// written directly under a RemoteTask's `spec:`.
 fn spec_from_params(params: &[Param]) -> Result<RemoteTaskSpec, CustomRunError> {
     let mut capability: Option<String> = None;
     let mut script: Option<String> = None;
@@ -158,12 +118,6 @@ fn spec_from_params(params: &[Param]) -> Result<RemoteTaskSpec, CustomRunError> 
             "cleanup" => cleanup = p.value.as_str().map(str::to_string).or(cleanup),
             "env" => {
                 if let Some(raw) = p.value.as_str() {
-                    // YAML blob string, e.g.:
-                    //   - name: TEST_USER
-                    //     value: "ginger-tester"
-                    //   - name: TOKEN
-                    //     valueFrom:
-                    //       secretKeyRef: { name: my-secret, key: token }
                     let parsed: Vec<RemoteTaskEnvVar> = serde_yaml::from_str(raw)
                         .map_err(|e| CustomRunError::ParamParse(format!("env: {e}")))?;
                     env = parsed;
@@ -186,6 +140,109 @@ fn spec_from_params(params: &[Param]) -> Result<RemoteTaskSpec, CustomRunError> 
         script,
         cleanup,
     })
+}
+
+// ---- log mirror pod --------------------------------------------------
+
+pub async fn create_log_mirror_pod_by_name(
+    client: &Client,
+    ns: &str,
+    remote_task_name: &str,
+    remote_task_uid: String,
+) -> Result<(), kube::Error> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+
+    // Idempotent — skip if already exists
+    if pods.get_opt(remote_task_name).await?.is_some() {
+        println!("[customrun-controller] log-mirror pod {remote_task_name} already exists, skipping");
+        return Ok(());
+    }
+
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some(remote_task_name.to_string()),
+            namespace: Some(ns.to_string()),
+            owner_references: Some(vec![OwnerReference {
+                api_version: "gingersociety.org/v1alpha1".to_string(),
+                kind: "RemoteTask".to_string(),
+                name: remote_task_name.to_string(),
+                uid: remote_task_uid,
+                controller: Some(true),
+                block_owner_deletion: Some(false),
+            }]),
+            labels: Some(BTreeMap::from([
+                ("app".to_string(), "remote-task-log-mirror".to_string()),
+                ("remotetask".to_string(), remote_task_name.to_string()),
+            ])),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            restart_policy: Some("Never".to_string()),
+            service_account_name: Some("remote-task-controller".to_string()),
+            containers: vec![Container {
+                name: "log-mirror".to_string(),
+                image: Some("bitnami/kubectl:latest".to_string()),
+                command: Some(vec!["/bin/sh".to_string()]),
+                args: Some(vec![
+                    "-c".to_string(),
+                    format!(
+                        r#"
+SEEN=""
+echo "[log-mirror] Watching RemoteTask {name} in namespace {ns}..."
+while true; do
+  PHASE=$(kubectl get remotetask {name} -n {ns} \
+    -o jsonpath='{{.status.phase}}' 2>/dev/null || echo "pending")
+
+  EVENTS=$(kubectl get events -n {ns} \
+    --field-selector involvedObject.name={name},reason=RemoteTaskLog \
+    --sort-by='.metadata.creationTimestamp' \
+    -o jsonpath='{{range .items[*]}}{{.metadata.uid}} {{.message}}{{"\n"}}{{end}}' \
+    2>/dev/null || true)
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    UID_VAL=$(echo "$line" | cut -d' ' -f1)
+    MSG=$(echo "$line" | cut -d' ' -f2-)
+    case "$SEEN" in
+      *"$UID_VAL"*) ;;
+      *) echo "$MSG"; SEEN="$SEEN $UID_VAL" ;;
+    esac
+  done <<EOF
+$EVENTS
+EOF
+
+  if [ "$PHASE" = "succeeded" ]; then
+    echo "[log-mirror] RemoteTask completed successfully"
+    exit 0
+  elif [ "$PHASE" = "failed" ]; then
+    FAIL_MSG=$(kubectl get remotetask {name} -n {ns} \
+      -o jsonpath='{{.status.message}}' 2>/dev/null || echo "unknown error")
+    echo "[log-mirror] RemoteTask failed: $FAIL_MSG"
+    exit 1
+  fi
+
+  sleep 2
+done
+"#,
+                        name = remote_task_name,
+                        ns = ns,
+                    ),
+                ]),
+                env: Some(vec![K8sEnvVar {
+                    name: "HOME".to_string(),
+                    value: Some("/tmp".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    pods.create(&PostParams::default(), &pod).await?;
+    println!("[customrun-controller] created log-mirror pod {remote_task_name}");
+    Ok(())
 }
 
 // ---- reconcile --------------------------------------------------------
@@ -212,11 +269,11 @@ pub async fn reconcile_customrun(
         .custom_ref
         .ok_or_else(|| CustomRunError::MissingCustomRef(name.clone()))?;
 
-    let targets_us = custom_ref.api_version.as_deref() == Some(&format!("{OUR_GROUP}/{OUR_VERSION}"))
-        && custom_ref.kind.as_deref() == Some(OUR_KIND);
+    let targets_us =
+        custom_ref.api_version.as_deref() == Some(&format!("{OUR_GROUP}/{OUR_VERSION}"))
+            && custom_ref.kind.as_deref() == Some(OUR_KIND);
 
     if !targets_us {
-        // Not for us — some other custom task controller owns this CustomRun.
         return Ok(Action::await_change());
     }
 
@@ -240,8 +297,6 @@ pub async fn reconcile_customrun(
     let remote_tasks: Api<RemoteTask> = Api::namespaced(ctx.client.clone(), &ns);
     let customruns = customrun_api(&ctx.client, &ns);
 
-    // The owned RemoteTask shares the CustomRun's name 1:1 — simplest
-    // possible mapping; avoids extra bookkeeping to find "our" RemoteTask.
     match remote_tasks.get_opt(&name).await? {
         Some(existing) => {
             sync_status_from_remote_task(&customruns, &name, &existing).await?;
@@ -257,8 +312,26 @@ pub async fn reconcile_customrun(
             };
 
             let task = build_owned_remote_task(&run, &name, &ns, task_spec);
+            let created = remote_tasks.create(&PostParams::default(), &task).await?;
 
-            remote_tasks.create(&PostParams::default(), &task).await?;
+            // Create the log-mirror pod immediately after the RemoteTask,
+            // using the UID from the freshly created object so the owner
+            // reference is correct and the pod is GC'd with the RemoteTask.
+            let remote_task_uid = created
+                .uid()
+                .unwrap_or_default();
+
+            if let Err(e) = create_log_mirror_pod_by_name(
+                &ctx.client,
+                &ns,
+                &name,
+                remote_task_uid,
+            )
+            .await
+            {
+                // Non-fatal — the job will still run, just no dashboard pod
+                eprintln!("[customrun-controller] failed to create log-mirror pod: {e}");
+            }
 
             emit_event(
                 &ctx.client,
@@ -337,6 +410,7 @@ async fn set_customrun_running(
             last_transition_time: Some(now()),
         }],
         None,
+        false,
     )
     .await
 }
@@ -360,6 +434,7 @@ async fn set_customrun_succeeded(
             name: "exitCode".to_string(),
             value: exit_code.to_string(),
         }]),
+        true,
     )
     .await
 }
@@ -380,6 +455,7 @@ async fn set_customrun_failed(
             last_transition_time: Some(now()),
         }],
         None,
+        true,
     )
     .await
 }
@@ -389,10 +465,14 @@ async fn patch_status(
     name: &str,
     conditions: Vec<CustomRunCondition>,
     results: Option<Vec<CustomRunResult>>,
+    is_terminal: bool,
 ) -> Result<(), CustomRunError> {
     let mut status = json!({ "conditions": conditions });
     if let Some(results) = results {
         status["results"] = json!(results);
+    }
+    if is_terminal {
+        status["completionTime"] = json!(rfc3339_now());
     }
     let patch = json!({ "status": status });
     customruns
@@ -403,9 +483,6 @@ async fn patch_status(
 
 // ---- helpers --------------------------------------------------------------
 
-/// Builds the `ApiResource` + `Api<DynamicObject>` for `tekton.dev/v1beta1
-/// CustomRun` without doing a live discovery round-trip — we already know
-/// the exact group/version/kind/plural, so this is a static construction.
 fn customrun_api(client: &Client, ns: &str) -> Api<DynamicObject> {
     let ar = ApiResource {
         group: CUSTOMRUN_GROUP.to_string(),
@@ -457,4 +534,10 @@ fn object_ref_for(run: &DynamicObject) -> ObjectReference {
 
 fn now() -> Time {
     Time(k8s_openapi::jiff::Timestamp::now())
+}
+
+fn rfc3339_now() -> String {
+    k8s_openapi::jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
 }
