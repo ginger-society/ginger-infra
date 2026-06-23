@@ -2,13 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use k8s_openapi::api::core::v1::ObjectReference;
+use k8s_openapi::{api::core::v1::ObjectReference, apimachinery::pkg::apis::meta::v1::OwnerReference};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
-    api::{Api, DynamicObject, Patch, PatchParams},
-    discovery::ApiResource,
-    runtime::{controller::Action, watcher, Controller},
-    Client, ResourceExt,
+    Client, ResourceExt, api::{Api, DynamicObject, ObjectMeta, Patch, PatchParams, PostParams}, discovery::ApiResource, runtime::{Controller, controller::Action, watcher},
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -174,6 +171,11 @@ async fn dispatch(
         },
     )
     .await?;
+
+    if let Err(e) = create_log_mirror_pod(&ctx.client, ns, name, task).await {
+        // non-fatal — job still runs, just no dashboard logs
+        eprintln!("[tekton-controller] failed to create log-mirror pod: {e}");
+    }
 
     let request = RunJobRequest {
         capability: task.spec.capability.clone(),
@@ -412,3 +414,116 @@ struct RunJobRequest {
     env: Vec<EnvVar>,
 }
 
+use k8s_openapi::api::core::v1::{
+    Container, EnvVar as K8sEnvVar, Pod, PodSpec,
+};
+
+async fn create_log_mirror_pod(
+    client: &Client,
+    ns: &str,
+    remote_task_name: &str,
+    owner: &RemoteTask,
+) -> Result<(), ReconcileError> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+
+    // Idempotent — if the pod already exists (e.g. controller restarted), skip
+    if pods.get_opt(remote_task_name).await?.is_some() {
+        return Ok(());
+    }
+
+    let uid = owner.uid().unwrap_or_default();
+    let api_version = "gingersociety.org/v1alpha1".to_string();
+
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some(remote_task_name.to_string()),
+            namespace: Some(ns.to_string()),
+            // owned by the RemoteTask so it gets GC'd automatically
+            owner_references: Some(vec![OwnerReference {
+                api_version: api_version.clone(),
+                kind: "RemoteTask".to_string(),
+                name: remote_task_name.to_string(),
+                uid,
+                controller: Some(true),
+                block_owner_deletion: Some(false),
+            }]),
+            labels: Some(std::collections::BTreeMap::from([
+                ("app".to_string(), "remote-task-log-mirror".to_string()),
+                ("remotetask".to_string(), remote_task_name.to_string()),
+            ])),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            restart_policy: Some("Never".to_string()),
+            service_account_name: Some("remote-task-controller".to_string()),
+            containers: vec![Container {
+                name: "log-mirror".to_string(),
+                // kubectl is all we need — this image is tiny (~13MB)
+                image: Some("bitnami/kubectl:latest".to_string()),
+                command: Some(vec!["/bin/sh".to_string()]),
+                args: Some(vec![
+                    "-c".to_string(),
+                    // Poll events every 2s and print new ones.
+                    // Exit when the RemoteTask reaches a terminal phase.
+                    format!(r#"
+SEEN=""
+echo "[log-mirror] Waiting for RemoteTask {name} to start..."
+while true; do
+  PHASE=$(kubectl get remotetask {name} -n {ns} \
+    -o jsonpath='{{.status.phase}}' 2>/dev/null || echo "pending")
+
+  # Fetch all RemoteTaskLog events, print only ones we haven't seen
+  EVENTS=$(kubectl get events -n {ns} \
+    --field-selector involvedObject.name={name},reason=RemoteTaskLog \
+    --sort-by='.metadata.creationTimestamp' \
+    -o jsonpath='{{range .items[*]}}{{.metadata.uid}} {{.message}}{{"\n"}}{{end}}' \
+    2>/dev/null || true)
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    UID=$(echo "$line" | cut -d' ' -f1)
+    MSG=$(echo "$line" | cut -d' ' -f2-)
+    case "$SEEN" in
+      *"$UID"*) ;;  # already printed
+      *) echo "$MSG"; SEEN="$SEEN $UID" ;;
+    esac
+  done <<EOF
+$EVENTS
+EOF
+
+  if [ "$PHASE" = "succeeded" ]; then
+    echo "[log-mirror] RemoteTask completed successfully (exit 0)"
+    exit 0
+  elif [ "$PHASE" = "failed" ]; then
+    MSG=$(kubectl get remotetask {name} -n {ns} \
+      -o jsonpath='{{.status.message}}' 2>/dev/null || echo "unknown error")
+    echo "[log-mirror] RemoteTask failed: $MSG"
+    exit 1
+  fi
+
+  sleep 2
+done
+"#,
+                    name = remote_task_name,
+                    ns = ns,
+                    ),
+                ]),
+                env: Some(vec![
+                    // Prevent kubectl from complaining about missing home dir
+                    K8sEnvVar {
+                        name: "HOME".to_string(),
+                        value: Some("/tmp".to_string()),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    pods.create(&PostParams::default(), &pod).await?;
+    println!("[tekton-controller] created log-mirror pod for RemoteTask {remote_task_name}");
+    Ok(())
+}
