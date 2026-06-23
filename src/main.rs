@@ -15,13 +15,13 @@ use tokio::main;
 mod portalInstaller;
 mod start;
 mod wamp_client;
-mod heartbeat;
 mod plan;
 mod run_dry_run;
 mod rollout;
 mod load_fixtures;
 mod verbose_replace;
 mod install_helm_charts;
+mod rpc;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -61,7 +61,21 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
-    InstallHelmCharts
+    InstallHelmCharts,
+    Rpc {
+        /// Path to a .envrc-style file (export NAME=VALUE lines) to load as env vars
+        #[arg(long)]
+        envrc: String,
+        /// Path to the script to execute
+        #[arg(long)]
+        script: String,
+        /// Path to an optional cleanup script to run after the main script
+        #[arg(long)]
+        cleanup: Option<String>,
+        /// Device capability to target (e.g. "unix")
+        #[arg(long, default_value = "unix")]
+        capability: String,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -86,6 +100,9 @@ async fn check_session_gurad(
 ) {
     
             match cli.command {
+                Commands::Rpc { envrc, script, cleanup, capability } => {
+                    rpc::run_rpc(&envrc, &script, cleanup.as_deref(), &capability).await;
+                }
                 Commands::Init => {
                     println!("Hello, world!");
                 }

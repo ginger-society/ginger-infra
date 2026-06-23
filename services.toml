@@ -4,7 +4,7 @@ dir = "."
 spec_url = "/openapi.json"
 
 [services."@ginger-society/GingerPresence"]
-prod = "http://localhost:8089/presence"
+prod = "https://api.gingersociety.org/presence"
 stage = "http://localhost:8089/presence"
 
 [services."@ginger-society/MetadataService"]

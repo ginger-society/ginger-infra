@@ -393,12 +393,13 @@ impl WampClient {
     pub async fn call(
         &self,
         function: &str,
-        target_channel:String,
+        target_channel: String,
         args: Value,
         kwargs: Value,
     ) -> Result<Value, Value> {
         let correlation_id = format!("corr-{}", uuid());
         let reply_to = self.channel.clone();
+        let started_at = tokio::time::Instant::now();
 
         let mut kw = kwargs.as_object().cloned().unwrap_or_default();
         kw.insert("function".to_string(), Value::String(function.to_string()));
@@ -439,10 +440,27 @@ impl WampClient {
         }
 
         match tokio::time::timeout(tokio::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => {
+                let elapsed = started_at.elapsed();
+                match &result {
+                    Ok(v) => println!(
+                        "[client] ← REPLY fn='{}' corr={} status=ok latency={:.1}ms payload={}",
+                        function, correlation_id, elapsed.as_secs_f64() * 1000.0, v
+                    ),
+                    Err(e) => println!(
+                        "[client] ← REPLY fn='{}' corr={} status=error latency={:.1}ms payload={}",
+                        function, correlation_id, elapsed.as_secs_f64() * 1000.0, e
+                    ),
+                }
+                result
+            }
             Ok(Err(_)) => Err(serde_json::json!({"error": "reply channel dropped"})),
             Err(_) => {
                 self.pending.lock().await.remove(&correlation_id);
+                println!(
+                    "[client] ← REPLY fn='{}' corr={} status=timeout latency=30000ms",
+                    function, correlation_id
+                );
                 Err(serde_json::json!({"error": "call timed out"}))
             }
         }
@@ -555,13 +573,14 @@ impl WampClient {
             }
             Some(h) => {
                 println!("[client] ← CALL fn='{}' corr={:?}", function, correlation_id);
-                
-                // spawn handler so it doesn't block the select loop
+                let started_at = tokio::time::Instant::now(); // ← add this
+
                 let channel = self.channel.clone();
                 let publish_tx = self.publish_tx.clone();
-                
+
                 tokio::spawn(async move {
                     let result = h(args, kwargs).await;
+                    let elapsed = started_at.elapsed(); // ← add this
 
                     if let (Some(corr_id), Some(rt)) = (correlation_id, reply_to) {
                         let (payload, is_error) = match result {
@@ -569,10 +588,13 @@ impl WampClient {
                             Err(e) => (e, true),
                         };
                         let reply = make_reply(&channel, &rt, &corr_id, payload, is_error);
-                        let msg = serde_json::to_string(&reply).unwrap();
-                        println!("[client] → REPLY fn='{}' corr={} is_error={}", function, corr_id, is_error);
 
-                        // send reply via publish channel instead of ws_stream directly
+                        println!(
+                            "[client] → REPLY fn='{}' corr={} is_error={} latency={:.1}ms",
+                            function, corr_id, is_error,
+                            elapsed.as_secs_f64() * 1000.0  // ← add this
+                        );
+
                         if let Ok(guard) = publish_tx.try_lock() {
                             if let Some(tx) = guard.as_ref() {
                                 let _ = tx.send(reply).await;
