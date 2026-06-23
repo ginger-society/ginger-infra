@@ -1,6 +1,6 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
 # Changed from bullseye to bookworm
-FROM rust:1-slim-bookworm AS builder
+FROM gingersociety/rust-rocket-api-builder:latest as builder
 
 WORKDIR /build
 ARG GINGER_TOKEN
