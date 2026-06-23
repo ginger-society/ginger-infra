@@ -1,30 +1,3 @@
-// src/bin/tekton-controller.rs
-//
-// remote-task-controller — watches RemoteTask CRDs, resolves their env vars,
-// dispatches the job to the sidekick service (the same /run-job SSE endpoint
-// `ginger-infra rpc` talks to), and writes status back onto the RemoteTask.
-//
-// Deliberately narrow scope for v1 — see remote_task.rs's module doc comment
-// for the full list. The two most important gaps, repeated here because
-// they're easy to forget while reading reconcile code in isolation:
-//
-//   - NOT HANDLED: cancellation. If the owning PipelineRun is deleted or
-//     cancelled, nothing currently tells the device to stop running the
-//     script. The job runs to completion on the device regardless.
-//   - NOT HANDLED: restart-resume. If this controller process restarts
-//     while a RemoteTask is Running, the SSE connection is lost. The
-//     RemoteTask is left stuck in `Running` forever — there is no
-//     reconnect-to-in-flight-job logic. A future version should either
-//     add a "stale Running RemoteTask" sweep (mark Failed after some
-//     timeout with no status update) or have the sidekick support
-//     resubscribing to an existing job_id's event stream.
-//
-// Env resolution is intentionally narrow too: only `value` and
-// `valueFrom.secretKeyRef` are supported. No configMapKeyRef, no Tekton
-// `$(params.x)` / `$(context.x)` expression resolution — those require a
-// real expression engine and access to the owning PipelineRun, which this
-// version does not implement.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -63,11 +36,17 @@ enum ReconcileError {
 struct ControllerContext {
     client: Client,
     http: reqwest::Client,
+    sidekick_url: String,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("[tekton-controller] starting...");
+
+    let sidekick_url = std::env::var("SIDEKICK_URL")
+        .map_err(|_| anyhow::anyhow!("SIDEKICK_URL env var is required"))?;
+
+    println!("[tekton-controller] sidekick_url={}", sidekick_url);
 
     let client = Client::try_default().await?;
     let remote_tasks: Api<RemoteTask> = Api::all(client.clone());
@@ -75,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
     let ctx = Arc::new(ControllerContext {
         client: client.clone(),
         http: reqwest::Client::new(),
+        sidekick_url,
     });
 
     println!("[tekton-controller] watching RemoteTask across all namespaces");
@@ -106,30 +86,20 @@ async fn reconcile(
 
     let phase = task.status.as_ref().map(|s| s.phase.clone()).unwrap_or_default();
 
-    // Only act on tasks that haven't been dispatched yet. Once a RemoteTask
-    // reaches Running/Succeeded/Failed, this version does not reconcile it
-    // further — no retries, no cancellation, no resume. See module doc.
     match phase {
         RemoteTaskPhase::Pending => {
             println!("[tekton-controller] dispatching {}/{}", ns, name);
             dispatch(&task, &ctx, &ns, &name).await?;
         }
         RemoteTaskPhase::Running => {
-            println!(
-                "[tekton-controller] {}/{} already Running — no resume logic in this version, leaving as-is",
-                ns, name
-            );
+            println!("[tekton-controller] {}/{} already Running — no resume logic, leaving as-is", ns, name);
         }
-        RemoteTaskPhase::Succeeded | RemoteTaskPhase::Failed => {
-            // terminal — nothing to do
-        }
+        RemoteTaskPhase::Succeeded | RemoteTaskPhase::Failed => {}
     }
 
     Ok(Action::await_change())
 }
 
-/// Resolve env, mark the RemoteTask Running, POST to the sidekick, stream
-/// the SSE response, and write Succeeded/Failed status at the end.
 async fn dispatch(
     task: &RemoteTask,
     ctx: &ControllerContext,
@@ -158,7 +128,7 @@ async fn dispatch(
         env,
     };
 
-    let result = stream_job(&ctx.http, &task.spec.sidekick_url, &request).await;
+    let result = stream_job(&ctx.http, &ctx.sidekick_url, &request).await;
 
     let final_status = match result {
         Ok(exit_code) => RemoteTaskStatus {
@@ -191,11 +161,6 @@ async fn dispatch(
     Ok(())
 }
 
-/// Resolve `value` and `valueFrom.secretKeyRef` entries into a flat
-/// name → value map. Any other source kind is not supported in this
-/// version and is skipped with a loud eprintln rather than silently
-/// dropped, so a RemoteTask author notices immediately if they reach
-/// for something not yet implemented (e.g. configMapKeyRef).
 async fn resolve_env(
     client: &Client,
     ns: &str,
@@ -232,8 +197,7 @@ async fn resolve_env(
         }
 
         eprintln!(
-            "[tekton-controller] env '{}' has no supported source (only `value` and \
-             `valueFrom.secretKeyRef` are implemented) — skipping, value will be unset on the device",
+            "[tekton-controller] env '{}' has no supported source — skipping",
             env.name
         );
     }
@@ -253,25 +217,8 @@ async fn set_status(
 }
 
 fn now() -> Time {
-    // k8s-openapi 0.27.0 switched Time's inner representation from
-    // chrono::DateTime<Utc> to jiff::Timestamp (see the v0.27.0 release
-    // notes: "chrono::DateTime has been replaced by jiff::Timestamp in
-    // the implementations of ... Time"). k8s_openapi re-exports jiff
-    // itself, so we use that instead of pulling in our own chrono dep.
     Time(k8s_openapi::jiff::Timestamp::now())
 }
-
-// ── sidekick HTTP/SSE client ─────────────────────────────────────────────────
-//
-// This intentionally duplicates the shape (not the code) of rpc.rs's
-// RunJobRequest/stream_job. They stay separate on purpose: rpc.rs is a
-// human-invoked CLI command reading files off disk and printing to a
-// terminal; this is a controller reading from Kubernetes objects and
-// writing structured status back. Sharing one generic "run a job and
-// stream results" helper across both would mean every change to either
-// caller's surrounding logic risks the other — these two call sites have
-// different enough callers (human vs. control loop) that a shared
-// abstraction would be coupling for its own sake rather than real reuse.
 
 #[derive(Debug, Serialize)]
 struct EnvVar {
@@ -288,10 +235,6 @@ struct RunJobRequest {
     env: HashMap<String, String>,
 }
 
-/// POST the job and stream SSE `data: {...}` frames until `done`/`error`.
-/// Returns the exit code on success, or a ReconcileError on any failure —
-/// including a nonzero exit code, which is surfaced as a JobError so the
-/// caller writes a Failed status rather than crashing the reconcile loop.
 async fn stream_job(
     client: &reqwest::Client,
     url: &str,
@@ -347,10 +290,6 @@ async fn stream_job(
                 "log" => {
                     let stream_name = event.get("stream").and_then(|v| v.as_str()).unwrap_or("stdout");
                     let line_text = event.get("line").and_then(|v| v.as_str()).unwrap_or("");
-                    // v1: logs go to the controller's own stdout/stderr only.
-                    // Forwarding into a Tekton-visible log sink (companion
-                    // Pod or pluggable sink, per the design doc) is future
-                    // work, not implemented here.
                     println!("[remote-task:{stream_name}] {line_text}");
                 }
                 "done" => {

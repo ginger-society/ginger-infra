@@ -1,22 +1,3 @@
-// src/install_tekton_crd.rs
-//
-// `ginger-infra install-tekton-crd` — one-shot bootstrap command. Generates:
-//   1. the RemoteTask CustomResourceDefinition (from the Rust types in
-//      remote_task.rs, via kube::CustomResourceExt — the schema is derived
-//      from the struct, so the CRD on the cluster can never drift from
-//      what the controller actually understands)
-//   2. RBAC for the controller (ServiceAccount, ClusterRole, ClusterRoleBinding)
-//   3. the controller Deployment itself
-//
-// All three are applied via `kubectl apply -f -`, the same pattern rollout.rs
-// uses for normal manifests — nothing is written to disk, and .envrc/KUBECONFIG
-// resolution follows the same find_envrc_bounded convention as everywhere else
-// in this CLI, scoped to the current directory.
-//
-// This is a one-shot "make this cluster capable of RemoteTask" operation —
-// the same category as install_helm_charts and install_or_update_portal —
-// not something that needs to run on every reconcile.
-
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -26,18 +7,18 @@ use kube::CustomResourceExt;
 
 use crate::run_dry_run::{find_envrc_bounded, parse_envrc};
 
-/// Controller image to deploy. Override via --image if the user builds
-/// and pushes their own tag; this default assumes the project publishes
-/// to the same registry pattern as other ginger-society images.
 const DEFAULT_CONTROLLER_IMAGE: &str = "gingersociety/remote-task-controller:latest";
 const CONTROLLER_NAMESPACE: &str = "tekton-pipelines";
 const CONTROLLER_NAME: &str = "remote-task-controller";
 
 pub fn run_install_tekton_crd(image: Option<&str>, sidekick_url: Option<&str>) -> anyhow::Result<()> {
+    let sidekick_url = sidekick_url
+        .ok_or_else(|| anyhow::anyhow!("--sidekick-url is required"))?;
+
     println!("── Generating RemoteTask CRD + controller manifests ─");
 
     let crd_yaml = render_crd()?;
-    println!("  ✓ RemoteTask CRD schema generated from remote_task.rs types");
+    println!("  ✓ RemoteTask CRD schema generated");
 
     let rbac_yaml = render_rbac();
     println!("  ✓ RBAC manifests generated");
@@ -46,8 +27,6 @@ pub fn run_install_tekton_crd(image: Option<&str>, sidekick_url: Option<&str>) -
     let deployment_yaml = render_deployment(controller_image, sidekick_url);
     println!("  ✓ Controller Deployment generated (image: {})", controller_image);
 
-    // Concatenate as a multi-document YAML stream — kubectl apply -f -
-    // handles `---`-separated documents in a single stdin payload.
     let combined = format!(
         "{}\n---\n{}\n---\n{}",
         crd_yaml.trim_end(),
@@ -55,8 +34,6 @@ pub fn run_install_tekton_crd(image: Option<&str>, sidekick_url: Option<&str>) -
         deployment_yaml.trim_end()
     );
 
-    // resolve .envrc for KUBECONFIG, bounded by cwd — same convention as
-    // every other command that shells out to kubectl in this CLI
     let cwd = std::env::current_dir()?;
     let env_vars = match find_envrc_bounded(&cwd, &cwd) {
         Some(envrc_path) => {
@@ -83,19 +60,12 @@ pub fn run_install_tekton_crd(image: Option<&str>, sidekick_url: Option<&str>) -
     }
 }
 
-/// Generate the CRD YAML directly from the Rust spec/status types, so the
-/// schema the apiserver validates against can never drift from what the
-/// controller's serde structs actually deserialize.
 fn render_crd() -> anyhow::Result<String> {
     let crd = RemoteTask::crd();
     serde_yaml::to_string(&crd)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize generated CRD to YAML: {}", e))
+        .map_err(|e| anyhow::anyhow!("Failed to serialize CRD to YAML: {}", e))
 }
 
-/// RBAC the controller needs: get/list/watch on RemoteTask (+ update status),
-/// get on Secret (env resolution), and basic event recording. Deliberately
-/// scoped to exactly what install_tekton_crd.rs's reconcile loop touches —
-/// expand only when the controller's actual code needs more.
 fn render_rbac() -> String {
     format!(
         r#"apiVersion: v1
@@ -140,17 +110,7 @@ subjects:
     )
 }
 
-fn render_deployment(image: &str, sidekick_url: Option<&str>) -> String {
-    let sidekick_env = match sidekick_url {
-        Some(url) => format!(
-            r#"
-            - name: SIDEKICK_URL
-              value: "{}""#,
-            url
-        ),
-        None => String::new(),
-    };
-
+fn render_deployment(image: &str, sidekick_url: &str) -> String {
     format!(
         r#"apiVersion: apps/v1
 kind: Deployment
@@ -168,21 +128,29 @@ spec:
         app: {name}
     spec:
       serviceAccountName: {name}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: controller
           image: {image}
-          env:{sidekick_env}
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: SIDEKICK_URL
+              value: "{sidekick_url}"
 "#,
         name = CONTROLLER_NAME,
         ns = CONTROLLER_NAMESPACE,
         image = image,
-        sidekick_env = sidekick_env,
+        sidekick_url = sidekick_url,
     )
 }
 
-/// Pipe `content` into `kubectl apply -f -`. Mirrors rollout.rs's
-/// kubectl_apply_stdin exactly — nothing written to disk, env vars
-/// (KUBECONFIG etc.) injected from the resolved .envrc.
 fn kubectl_apply_stdin(content: &str, env_vars: &HashMap<String, String>) -> anyhow::Result<bool> {
     let mut cmd = Command::new("kubectl");
     cmd.args(["apply", "-f", "-"]);
