@@ -15,15 +15,12 @@ pub async fn emit_event(
     let events: Api<Event> = Api::namespaced(client.clone(), ns);
     let now = Time(k8s_openapi::jiff::Timestamp::now());
 
-    // Hash message content + nanoseconds to guarantee a unique name
-    // even for multiple lines arriving within the same second
     let hash = {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut h = DefaultHasher::new();
         message.hash(&mut h);
         now.0.subsec_nanosecond().hash(&mut h);
-        // also mix in the target name so concurrent tasks don't collide
         target.name.hash(&mut h);
         h.finish()
     };
