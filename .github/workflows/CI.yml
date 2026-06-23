@@ -33,7 +33,7 @@ jobs:
     #   run: ginger-connector refresh
     
     - name: Build Docker image
-      run: docker build . --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }}  -t gingersociety/remote-task-controller:latest . -f Dockerfile.tekton-controller
+      run: docker build --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }}  -t gingersociety/remote-task-controller:latest . -f Dockerfile.tekton-controller
 
     - name: Push Docker image
       run: docker push gingersociety/remote-task-controller:latest
