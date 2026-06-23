@@ -108,7 +108,7 @@ async fn dispatch(
 ) -> Result<(), ReconcileError> {
     let api: Api<RemoteTask> = Api::namespaced(ctx.client.clone(), ns);
 
-    let env = resolve_env(&ctx.client, ns, &task.spec.env).await?;
+    let env_map = resolve_env(&ctx.client, ns, &task.spec.env).await?;
 
     set_status(
         &api,
@@ -125,7 +125,7 @@ async fn dispatch(
         capability: task.spec.capability.clone(),
         script: task.spec.script.clone(),
         cleanup_script: task.spec.cleanup.clone(),
-        env,
+        env: env_map.into_iter().map(|(name, value)| EnvVar { name, value }).collect(),
     };
 
     let result = stream_job(&ctx.http, &ctx.sidekick_url, &request).await;
@@ -232,7 +232,7 @@ struct RunJobRequest {
     script: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     cleanup_script: Option<String>,
-    env: HashMap<String, String>,
+    env: Vec<EnvVar>,
 }
 
 async fn stream_job(
