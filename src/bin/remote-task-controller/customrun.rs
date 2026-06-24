@@ -1,7 +1,3 @@
-//! Bridges Tekton `CustomRun` (tekton.dev/v1beta1) objects whose `customRef`
-//! points at `gingersociety.org/v1alpha1, Kind=RemoteTask` to the existing
-//! RemoteTask CRD + controller, with no pod involved on the Tekton side.
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -106,8 +102,6 @@ struct CustomRunResult {
     value: String,
 }
 
-// ---- param parsing -------------------------------------------------------
-
 fn spec_from_params(params: &[Param]) -> Result<RemoteTaskSpec, CustomRunError> {
     let mut capability: Option<String> = None;
     let mut script: Option<String> = None;
@@ -117,8 +111,8 @@ fn spec_from_params(params: &[Param]) -> Result<RemoteTaskSpec, CustomRunError> 
     for p in params {
         match p.name.as_str() {
             "capability" => capability = p.value.as_str().map(str::to_string).or(capability),
-            "script" => script = p.value.as_str().map(str::to_string).or(script),
-            "cleanup" => cleanup = p.value.as_str().map(str::to_string).or(cleanup),
+            "script"     => script     = p.value.as_str().map(str::to_string).or(script),
+            "cleanup"    => cleanup    = p.value.as_str().map(str::to_string).or(cleanup),
             "env" => {
                 if let Some(raw) = p.value.as_str() {
                     let parsed: Vec<RemoteTaskEnvVar> = serde_yaml::from_str(raw)
@@ -137,15 +131,8 @@ fn spec_from_params(params: &[Param]) -> Result<RemoteTaskSpec, CustomRunError> 
     let script = script
         .ok_or_else(|| CustomRunError::ParamParse("missing required param 'script'".into()))?;
 
-    Ok(RemoteTaskSpec {
-        capability,
-        env,
-        script,
-        cleanup,
-    })
+    Ok(RemoteTaskSpec { capability, env, script, cleanup })
 }
-
-// ---- log mirror pod ------------------------------------------------------
 
 pub async fn create_log_mirror_pod_by_name(
     client: &Client,
@@ -156,9 +143,7 @@ pub async fn create_log_mirror_pod_by_name(
     let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
 
     if pods.get_opt(remote_task_name).await?.is_some() {
-        println!(
-            "[customrun-controller] log-mirror pod {remote_task_name} already exists, skipping"
-        );
+        println!("[customrun-controller] log-mirror pod {remote_task_name} already exists, skipping");
         return Ok(());
     }
 
@@ -191,29 +176,22 @@ pub async fn create_log_mirror_pod_by_name(
                     "-c".to_string(),
                     format!(
                         r#"
-SEEN=""
-echo "[log-mirror] Watching RemoteTask {name} in namespace {ns}..."
+SEEN_LINES=0
+echo "[log-mirror] Watching RemoteTask {name} logs in {ns}..."
 while true; do
   PHASE=$(kubectl get remotetask {name} -n {ns} \
     -o jsonpath='{{.status.phase}}' 2>/dev/null || echo "pending")
 
-  EVENTS=$(kubectl get events -n {ns} \
-    --field-selector involvedObject.name={name},reason=RemoteTaskLog \
-    --sort-by='.metadata.creationTimestamp' \
-    -o jsonpath='{{range .items[*]}}{{.metadata.uid}} {{.message}}{{"\n"}}{{end}}' \
-    2>/dev/null || true)
+  LOGS=$(kubectl get configmap {name} -n {ns} \
+    -o jsonpath='{{.data.logs}}' 2>/dev/null || true)
 
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    UID_VAL=$(echo "$line" | cut -d' ' -f1)
-    MSG=$(echo "$line" | cut -d' ' -f2-)
-    case "$SEEN" in
-      *"$UID_VAL"*) ;;
-      *) echo "$MSG"; SEEN="$SEEN $UID_VAL" ;;
-    esac
-  done <<EOF
-$EVENTS
-EOF
+  if [ -n "$LOGS" ]; then
+    TOTAL=$(printf '%s\n' "$LOGS" | wc -l)
+    if [ "$TOTAL" -gt "$SEEN_LINES" ]; then
+      printf '%s\n' "$LOGS" | tail -n +"$((SEEN_LINES + 1))"
+      SEEN_LINES=$TOTAL
+    fi
+  fi
 
   if [ "$PHASE" = "succeeded" ]; then
     echo "[log-mirror] RemoteTask completed successfully"
@@ -225,7 +203,7 @@ EOF
     exit 1
   fi
 
-  sleep 2
+  sleep 1
 done
 "#,
                         name = remote_task_name,
@@ -249,28 +227,20 @@ done
     Ok(())
 }
 
-// ---- reconcile -----------------------------------------------------------
-
 pub async fn reconcile_customrun(
     run: Arc<DynamicObject>,
     ctx: Arc<CustomRunContext>,
 ) -> Result<Action, CustomRunError> {
     let name = run.name_any();
     let ns = run
-        .metadata
-        .namespace
-        .clone()
+        .metadata.namespace.clone()
         .unwrap_or_else(|| "default".to_string());
 
-    let spec_value = run
-        .data
-        .get("spec")
-        .cloned()
+    let spec_value = run.data.get("spec").cloned()
         .unwrap_or(Value::Object(Default::default()));
     let spec: CustomRunSpec = serde_json::from_value(spec_value)?;
 
-    let custom_ref = spec
-        .custom_ref
+    let custom_ref = spec.custom_ref
         .ok_or_else(|| CustomRunError::MissingCustomRef(name.clone()))?;
 
     let targets_us =
@@ -281,8 +251,7 @@ pub async fn reconcile_customrun(
         return Ok(Action::await_change());
     }
 
-    let already_terminal = run
-        .data
+    let already_terminal = run.data
         .get("status")
         .and_then(|s| s.get("conditions"))
         .and_then(|c| c.as_array())
@@ -303,69 +272,37 @@ pub async fn reconcile_customrun(
 
     match remote_tasks.get_opt(&name).await? {
         Some(existing) => {
-            // Status sync: push RemoteTask phase → CustomRun conditions
             sync_status_from_remote_task(&customruns, &name, &existing).await?;
         }
         None => {
-            // ── 1. parse params ───────────────────────────────────────────────
             let task_spec = match spec_from_params(&spec.params) {
                 Ok(s) => s,
                 Err(e) => {
-                    set_customrun_failed(
-                        &customruns,
-                        &name,
-                        &format!("invalid params: {e}"),
-                    )
-                    .await?;
+                    set_customrun_failed(&customruns, &name, &format!("invalid params: {e}")).await?;
                     return Ok(Action::await_change());
                 }
             };
 
-            // ── 2. create RemoteTask ──────────────────────────────────────────
             let task = build_owned_remote_task(&run, &name, &ns, task_spec);
             let created = remote_tasks.create(&PostParams::default(), &task).await?;
             let remote_task_uid = created.uid().unwrap_or_default();
 
-            println!(
-                "[customrun-controller] created RemoteTask {ns}/{name} uid={remote_task_uid}"
-            );
+            println!("[customrun-controller] created RemoteTask {ns}/{name} uid={remote_task_uid}");
 
-            // ── 3. create log-mirror pod ──────────────────────────────────────
             if let Err(e) = create_log_mirror_pod_by_name(
-                &ctx.client,
-                &ns,
-                &name,
-                remote_task_uid.clone(),
-            )
-            .await
-            {
-                eprintln!(
-                    "[customrun-controller] failed to create log-mirror pod: {e}"
-                );
+                &ctx.client, &ns, &name, remote_task_uid.clone(),
+            ).await {
+                eprintln!("[customrun-controller] failed to create log-mirror pod: {e}");
             }
 
-            // ── 4. emit lifecycle event on the CustomRun ──────────────────────
             emit_event(
-                &ctx.client,
-                &ns,
-                &object_ref_for(&run),
-                "Normal",
-                "RemoteTaskCreated",
+                &ctx.client, &ns, &object_ref_for(&run),
+                "Normal", "RemoteTaskCreated",
                 &format!("Created RemoteTask {name} from CustomRun params"),
-            )
-            .await?;
+            ).await?;
 
-            // ── 5. mark CustomRun as Running ──────────────────────────────────
             set_customrun_running(&customruns, &name).await?;
 
-            // ── 6. dispatch to sidekick in a background task ──────────────────
-            //
-            // We spawn here so the reconciler returns immediately and the
-            // kube-rs controller loop stays healthy. The background task
-            // sets RemoteTask status to Running, streams the job, then sets
-            // the final Succeeded/Failed status. The customrun reconciler's
-            // requeue loop picks up the phase change and syncs CustomRun
-            // status accordingly.
             let task_ref = ObjectReference {
                 api_version: Some("gingersociety.org/v1alpha1".to_string()),
                 kind: Some("RemoteTask".to_string()),
@@ -389,9 +326,7 @@ pub async fn reconcile_customrun(
         }
     }
 
-    Ok(Action::requeue(std::time::Duration::from_secs(
-        REQUEUE_WHILE_RUNNING_SECS,
-    )))
+    Ok(Action::requeue(std::time::Duration::from_secs(REQUEUE_WHILE_RUNNING_SECS)))
 }
 
 pub fn customrun_error_policy(
@@ -403,35 +338,23 @@ pub fn customrun_error_policy(
     Action::requeue(std::time::Duration::from_secs(REQUEUE_AFTER_ERROR_SECS))
 }
 
-// ---- status syncing ------------------------------------------------------
-
 async fn sync_status_from_remote_task(
     customruns: &Api<DynamicObject>,
     name: &str,
     task: &RemoteTask,
 ) -> Result<(), CustomRunError> {
-    let phase = task
-        .status
-        .as_ref()
-        .map(|s| s.phase.clone())
-        .unwrap_or_default();
+    let phase = task.status.as_ref().map(|s| s.phase.clone()).unwrap_or_default();
 
     match phase {
         RemoteTaskPhase::Pending | RemoteTaskPhase::Running => {
             set_customrun_running(customruns, name).await?;
         }
         RemoteTaskPhase::Succeeded => {
-            let exit_code = task
-                .status
-                .as_ref()
-                .and_then(|s| s.exit_code)
-                .unwrap_or(0);
+            let exit_code = task.status.as_ref().and_then(|s| s.exit_code).unwrap_or(0);
             set_customrun_succeeded(customruns, name, exit_code).await?;
         }
         RemoteTaskPhase::Failed => {
-            let msg = task
-                .status
-                .as_ref()
+            let msg = task.status.as_ref()
                 .and_then(|s| s.message.clone())
                 .unwrap_or_else(|| "RemoteTask failed".to_string());
             set_customrun_failed(customruns, name, &msg).await?;
@@ -446,8 +369,7 @@ async fn set_customrun_running(
     name: &str,
 ) -> Result<(), CustomRunError> {
     patch_status(
-        customruns,
-        name,
+        customruns, name,
         vec![CustomRunCondition {
             type_: "Succeeded".to_string(),
             status: "Unknown".to_string(),
@@ -455,10 +377,8 @@ async fn set_customrun_running(
             message: "RemoteTask is running".to_string(),
             last_transition_time: Some(now()),
         }],
-        None,
-        false,
-    )
-    .await
+        None, false,
+    ).await
 }
 
 async fn set_customrun_succeeded(
@@ -467,8 +387,7 @@ async fn set_customrun_succeeded(
     exit_code: i32,
 ) -> Result<(), CustomRunError> {
     patch_status(
-        customruns,
-        name,
+        customruns, name,
         vec![CustomRunCondition {
             type_: "Succeeded".to_string(),
             status: "True".to_string(),
@@ -481,8 +400,7 @@ async fn set_customrun_succeeded(
             value: exit_code.to_string(),
         }]),
         true,
-    )
-    .await
+    ).await
 }
 
 async fn set_customrun_failed(
@@ -491,8 +409,7 @@ async fn set_customrun_failed(
     message: &str,
 ) -> Result<(), CustomRunError> {
     patch_status(
-        customruns,
-        name,
+        customruns, name,
         vec![CustomRunCondition {
             type_: "Succeeded".to_string(),
             status: "False".to_string(),
@@ -500,10 +417,8 @@ async fn set_customrun_failed(
             message: message.to_string(),
             last_transition_time: Some(now()),
         }],
-        None,
-        true,
-    )
-    .await
+        None, true,
+    ).await
 }
 
 async fn patch_status(
@@ -526,8 +441,6 @@ async fn patch_status(
         .await?;
     Ok(())
 }
-
-// ---- helpers -------------------------------------------------------------
 
 fn customrun_api(client: &Client, ns: &str) -> Api<DynamicObject> {
     let ar = ApiResource {

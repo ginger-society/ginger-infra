@@ -97,6 +97,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: ["tekton.dev"]
     resources: ["customruns"]
     verbs: ["get", "list", "watch", "update", "patch"]
@@ -180,8 +183,7 @@ fn kubectl_apply_stdin(content: &str, env_vars: &HashMap<String, String>) -> any
 
     if let Some(stdin) = child.stdin.take() {
         let mut stdin = stdin;
-        stdin
-            .write_all(content.as_bytes())
+        stdin.write_all(content.as_bytes())
             .map_err(|e| anyhow::anyhow!("Failed to write to kubectl stdin: {}", e))?;
     }
 

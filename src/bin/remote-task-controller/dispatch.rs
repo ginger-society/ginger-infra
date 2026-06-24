@@ -1,14 +1,10 @@
-//! Shared dispatch logic used by both the RemoteTask reconciler and the
-//! CustomRun reconciler. Handles env resolution, sidekick streaming, and
-//! status patching on the RemoteTask.
-
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use futures_util::StreamExt;
-use k8s_openapi::api::core::v1::ObjectReference;
+use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
-    api::{Api, Patch, PatchParams},
+    api::{Api, ObjectMeta, Patch, PatchParams, PostParams},
     Client,
 };
 use serde::Serialize;
@@ -60,8 +56,6 @@ pub async fn resolve_env(
     ns: &str,
     env_specs: &[ginger_infra::remote_task::RemoteTaskEnvVar],
 ) -> Result<HashMap<String, String>, DispatchError> {
-    use k8s_openapi::api::core::v1::Secret;
-
     let mut resolved = HashMap::new();
     let secrets_api: Api<Secret> = Api::namespaced(client.clone(), ns);
 
@@ -74,31 +68,22 @@ pub async fn resolve_env(
         if let Some(from) = &env.value_from {
             if let Some(secret_ref) = &from.secret_key_ref {
                 let secret = secrets_api.get(&secret_ref.name).await?;
-                let data =
-                    secret
-                        .data
-                        .ok_or_else(|| DispatchError::SecretKeyNotFound {
-                            secret: secret_ref.name.clone(),
-                            key: secret_ref.key.clone(),
-                            ns: ns.to_string(),
-                        })?;
-                let bytes =
-                    data.get(&secret_ref.key)
-                        .ok_or_else(|| DispatchError::SecretKeyNotFound {
-                            secret: secret_ref.name.clone(),
-                            key: secret_ref.key.clone(),
-                            ns: ns.to_string(),
-                        })?;
-                let value = String::from_utf8_lossy(&bytes.0).to_string();
-                resolved.insert(env.name.clone(), value);
+                let data = secret.data.ok_or_else(|| DispatchError::SecretKeyNotFound {
+                    secret: secret_ref.name.clone(),
+                    key: secret_ref.key.clone(),
+                    ns: ns.to_string(),
+                })?;
+                let bytes = data.get(&secret_ref.key).ok_or_else(|| DispatchError::SecretKeyNotFound {
+                    secret: secret_ref.name.clone(),
+                    key: secret_ref.key.clone(),
+                    ns: ns.to_string(),
+                })?;
+                resolved.insert(env.name.clone(), String::from_utf8_lossy(&bytes.0).to_string());
                 continue;
             }
         }
 
-        eprintln!(
-            "[tekton-controller] env '{}' has no supported source — skipping",
-            env.name
-        );
+        eprintln!("[tekton-controller] env '{}' has no supported source — skipping", env.name);
     }
 
     Ok(resolved)
@@ -112,9 +97,57 @@ pub async fn set_remote_task_status(
 ) -> Result<(), DispatchError> {
     let api: Api<RemoteTask> = Api::namespaced(client.clone(), ns);
     let patch = json!({ "status": status });
-    api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await?;
+    api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch)).await?;
     Ok(())
+}
+
+pub async fn append_log_to_configmap(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    line: &str,
+) -> Result<(), kube::Error> {
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
+
+    let existing = cms.get_opt(name).await?;
+    let mut existing_logs = existing
+        .as_ref()
+        .and_then(|cm| cm.data.as_ref())
+        .and_then(|d| d.get("logs"))
+        .cloned()
+        .unwrap_or_default();
+
+    existing_logs.push_str(line);
+    existing_logs.push('\n');
+
+    if existing.is_none() {
+        let cm = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                labels: Some(BTreeMap::from([
+                    ("app".to_string(), "remote-task-logs".to_string()),
+                    ("remotetask".to_string(), name.to_string()),
+                ])),
+                ..Default::default()
+            },
+            data: Some(BTreeMap::from([("logs".to_string(), existing_logs)])),
+            ..Default::default()
+        };
+        cms.create(&PostParams::default(), &cm).await?;
+    } else {
+        let patch = json!({ "data": { "logs": existing_logs } });
+        cms.patch(name, &PatchParams::default(), &Patch::Merge(&patch)).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn delete_log_configmap(client: &Client, ns: &str, name: &str) {
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
+    if let Err(e) = cms.delete(name, &Default::default()).await {
+        eprintln!("[tekton-controller] failed to delete log configmap {ns}/{name}: {e}");
+    }
 }
 
 pub async fn stream_job(
@@ -132,9 +165,7 @@ pub async fn stream_job(
         .json(request)
         .send()
         .await
-        .map_err(|e| {
-            DispatchError::SidekickRequest(format!("request to '{url}' failed: {e}"))
-        })?;
+        .map_err(|e| DispatchError::SidekickRequest(format!("request to '{url}' failed: {e}")))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -144,13 +175,13 @@ pub async fn stream_job(
         )));
     }
 
+    let task_name = task_ref.name.as_deref().unwrap_or("");
     let mut stream = response.bytes_stream();
     let mut buf = String::new();
+    let mut milestone_event_sent = false;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            DispatchError::SidekickRequest(format!("stream read error: {e}"))
-        })?;
+        let chunk = chunk.map_err(|e| DispatchError::SidekickRequest(format!("stream read error: {e}")))?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
 
         while let Some(idx) = buf.find('\n') {
@@ -178,51 +209,37 @@ pub async fn stream_job(
             match event_type {
                 "log" => {
                     let stream_name = event
-                        .get("stream")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("stdout");
-                    let line_text =
-                        event.get("line").and_then(|v| v.as_str()).unwrap_or("");
+                        .get("stream").and_then(|v| v.as_str()).unwrap_or("stdout");
+                    let line_text = event.get("line").and_then(|v| v.as_str()).unwrap_or("");
 
                     println!("[remote-task:{stream_name}] {line_text}");
 
-                    let message = format!("[{stream_name}] {line_text}");
+                    let log_line = format!("[{stream_name}] {line_text}");
 
-                    // Emit on RemoteTask
-                    if let Err(e) =
-                        emit_event(client, ns, task_ref, "Normal", "RemoteTaskLog", &message)
-                            .await
-                    {
-                        eprintln!(
-                            "[tekton-controller] failed to emit log event on remotetask: {e}"
-                        );
+                    if let Err(e) = append_log_to_configmap(client, ns, task_name, &log_line).await {
+                        eprintln!("[tekton-controller] failed to append log to configmap: {e}");
                     }
 
-                    // Also emit on owning CustomRun so dashboard Events tab shows output
-                    if let Some(cr_ref) = customrun_ref {
-                        if let Err(e) = emit_event(
-                            client, ns, cr_ref, "Normal", "RemoteTaskLog", &message,
-                        )
-                        .await
-                        {
-                            eprintln!(
-                                "[tekton-controller] failed to emit log event on customrun: {e}"
-                            );
+                    if !milestone_event_sent {
+                        if let Some(cr_ref) = customrun_ref {
+                            if let Err(e) = emit_event(
+                                client, ns, cr_ref, "Normal", "RemoteTaskLog",
+                                &format!("streaming — kubectl logs {task_name} -n {ns}"),
+                            ).await {
+                                eprintln!("[tekton-controller] failed to emit milestone event: {e}");
+                            }
+                            milestone_event_sent = true;
                         }
                     }
                 }
                 "done" => {
                     let exit_code = event
-                        .get("exit_code")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0) as i32;
+                        .get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                     return Ok(exit_code);
                 }
                 "error" => {
                     let message = event
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error");
+                        .get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
                     return Err(DispatchError::JobError(message.to_string()));
                 }
                 _ => {
@@ -237,8 +254,6 @@ pub async fn stream_job(
     ))
 }
 
-/// Full dispatch: resolve env, set Running, stream job, set final status.
-/// Called from a tokio::spawn so it doesn't block the reconciler.
 pub async fn run_dispatch(
     client: Client,
     http: reqwest::Client,
@@ -249,40 +264,31 @@ pub async fn run_dispatch(
     task_ref: ObjectReference,
     customrun_ref: Option<ObjectReference>,
 ) {
-    // resolve env vars
     let env_map = match resolve_env(&client, &ns, &task.spec.env).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("[tekton-controller] failed to resolve env for {ns}/{name}: {e}");
             let _ = set_remote_task_status(
-                &client,
-                &ns,
-                &name,
+                &client, &ns, &name,
                 RemoteTaskStatus {
                     phase: RemoteTaskPhase::Failed,
                     completion_time: Some(now()),
                     message: Some(format!("env resolution failed: {e}")),
                     ..Default::default()
                 },
-            )
-            .await;
+            ).await;
             return;
         }
     };
 
-    // mark Running
     if let Err(e) = set_remote_task_status(
-        &client,
-        &ns,
-        &name,
+        &client, &ns, &name,
         RemoteTaskStatus {
             phase: RemoteTaskPhase::Running,
             start_time: Some(now()),
             ..Default::default()
         },
-    )
-    .await
-    {
+    ).await {
         eprintln!("[tekton-controller] failed to set Running for {ns}/{name}: {e}");
         return;
     }
@@ -298,15 +304,8 @@ pub async fn run_dispatch(
     };
 
     let result = stream_job(
-        &client,
-        &http,
-        &sidekick_url,
-        &request,
-        &ns,
-        &task_ref,
-        customrun_ref.as_ref(),
-    )
-    .await;
+        &client, &http, &sidekick_url, &request, &ns, &task_ref, customrun_ref.as_ref(),
+    ).await;
 
     let final_status = match result {
         Ok(exit_code) => {
@@ -319,9 +318,7 @@ pub async fn run_dispatch(
                     type_: "Succeeded".to_string(),
                     status: "True".to_string(),
                     reason: Some("ExitCodeZero".to_string()),
-                    message: Some(format!(
-                        "Script completed successfully (exit {exit_code})"
-                    )),
+                    message: Some(format!("Script completed successfully (exit {exit_code})")),
                 }],
                 ..Default::default()
             }
@@ -346,4 +343,6 @@ pub async fn run_dispatch(
     if let Err(e) = set_remote_task_status(&client, &ns, &name, final_status).await {
         eprintln!("[tekton-controller] failed to set final status for {ns}/{name}: {e}");
     }
+
+    delete_log_configmap(&client, &ns, &name).await;
 }
