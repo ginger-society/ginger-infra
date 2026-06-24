@@ -1,4 +1,4 @@
-name: Build and Push Runner Docker Image
+name: Build, Push Docker Images, and Restart Deployment
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
       - main
 
 jobs:
-  build-and-push:
+  build-and-push-controller:
     runs-on: ubuntu-22.04
 
     steps:
@@ -35,11 +35,29 @@ jobs:
     #   run: ginger-connector refresh
 
     - name: Build Docker image
+      run: docker build --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} -t gingersociety/remote-task-controller:latest . -f Dockerfile.tekton-controller
+
+    - name: Push Docker image
+      run: docker push gingersociety/remote-task-controller:latest
+      continue-on-error: false
+
+    # - name: Update pipeline to passing
+    #   run: ginger-connector update-pipeline stage passing
+
+  build-and-push-runner:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Log in to Docker Hub
+      run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+      continue-on-error: false
+
+    - name: Build Docker image
       run: docker build --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} -t gingersociety/external-executor-runner:latest . -f Dockerfile.runner
 
     - name: Push Docker image
       run: docker push gingersociety/external-executor-runner:latest
       continue-on-error: false
-
-    # - name: Update pipeline to passing
-    #   run: ginger-connector update-pipeline stage passing
