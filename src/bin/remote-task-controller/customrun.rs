@@ -1,7 +1,5 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::{Container, EnvVar as K8sEnvVar, ObjectReference, Pod, PodSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 use kube::{
     api::{Api, DynamicObject, Patch, PatchParams, PostParams},
@@ -16,7 +14,6 @@ use serde_json::{json, Value};
 use ginger_infra::remote_task::{RemoteTask, RemoteTaskEnvVar, RemoteTaskPhase, RemoteTaskSpec};
 
 use crate::dispatch::{now, run_dispatch};
-use crate::events::emit_event;
 
 pub const CUSTOMRUN_GROUP: &str = "tekton.dev";
 pub const CUSTOMRUN_VERSION: &str = "v1beta1";
@@ -36,7 +33,7 @@ pub enum CustomRunError {
     Kube(#[from] kube::Error),
     #[error("customRun '{0}' is missing spec.customRef")]
     MissingCustomRef(String),
-    #[error("failed to parse params into RemoteTaskSpec: {0}")]
+    #[error("failed to parse params: {0}")]
     ParamParse(String),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
@@ -44,7 +41,6 @@ pub enum CustomRunError {
 
 pub struct CustomRunContext {
     pub client: Client,
-    pub http: reqwest::Client,
     pub sidekick_url: String,
 }
 
@@ -134,107 +130,12 @@ fn spec_from_params(params: &[Param]) -> Result<RemoteTaskSpec, CustomRunError> 
     Ok(RemoteTaskSpec { capability, env, script, cleanup })
 }
 
-pub async fn create_log_mirror_pod_by_name(
-    client: &Client,
-    ns: &str,
-    remote_task_name: &str,
-    remote_task_uid: String,
-) -> Result<(), kube::Error> {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
-
-    if pods.get_opt(remote_task_name).await?.is_some() {
-        println!("[customrun-controller] log-mirror pod {remote_task_name} already exists, skipping");
-        return Ok(());
-    }
-
-    let pod = Pod {
-        metadata: ObjectMeta {
-            name: Some(remote_task_name.to_string()),
-            namespace: Some(ns.to_string()),
-            owner_references: Some(vec![OwnerReference {
-                api_version: "gingersociety.org/v1alpha1".to_string(),
-                kind: "RemoteTask".to_string(),
-                name: remote_task_name.to_string(),
-                uid: remote_task_uid,
-                controller: Some(true),
-                block_owner_deletion: Some(false),
-            }]),
-            labels: Some(BTreeMap::from([
-                ("app".to_string(), "remote-task-log-mirror".to_string()),
-                ("remotetask".to_string(), remote_task_name.to_string()),
-            ])),
-            ..Default::default()
-        },
-        spec: Some(PodSpec {
-            restart_policy: Some("Never".to_string()),
-            service_account_name: Some("remote-task-controller".to_string()),
-            containers: vec![Container {
-                name: "log-mirror".to_string(),
-                image: Some("bitnami/kubectl:latest".to_string()),
-                command: Some(vec!["/bin/sh".to_string()]),
-                args: Some(vec![
-                    "-c".to_string(),
-                    format!(
-                        r#"
-SEEN_LINES=0
-echo "[log-mirror] Watching RemoteTask {name} logs in {ns}..."
-while true; do
-  PHASE=$(kubectl get remotetask {name} -n {ns} \
-    -o jsonpath='{{.status.phase}}' 2>/dev/null || echo "pending")
-
-  LOGS=$(kubectl get configmap {name} -n {ns} \
-    -o jsonpath='{{.data.logs}}' 2>/dev/null || true)
-
-  if [ -n "$LOGS" ]; then
-    TOTAL=$(printf '%s\n' "$LOGS" | wc -l)
-    if [ "$TOTAL" -gt "$SEEN_LINES" ]; then
-      printf '%s\n' "$LOGS" | tail -n +"$((SEEN_LINES + 1))"
-      SEEN_LINES=$TOTAL
-    fi
-  fi
-
-  if [ "$PHASE" = "succeeded" ]; then
-    echo "[log-mirror] RemoteTask completed successfully"
-    exit 0
-  elif [ "$PHASE" = "failed" ]; then
-    FAIL_MSG=$(kubectl get remotetask {name} -n {ns} \
-      -o jsonpath='{{.status.message}}' 2>/dev/null || echo "unknown error")
-    echo "[log-mirror] RemoteTask failed: $FAIL_MSG"
-    exit 1
-  fi
-
-  sleep 1
-done
-"#,
-                        name = remote_task_name,
-                        ns = ns,
-                    ),
-                ]),
-                env: Some(vec![K8sEnvVar {
-                    name: "HOME".to_string(),
-                    value: Some("/tmp".to_string()),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    pods.create(&PostParams::default(), &pod).await?;
-    println!("[customrun-controller] created log-mirror pod {remote_task_name}");
-    Ok(())
-}
-
 pub async fn reconcile_customrun(
     run: Arc<DynamicObject>,
     ctx: Arc<CustomRunContext>,
 ) -> Result<Action, CustomRunError> {
     let name = run.name_any();
-    let ns = run
-        .metadata.namespace.clone()
-        .unwrap_or_else(|| "default".to_string());
+    let ns = run.metadata.namespace.clone().unwrap_or_else(|| "default".to_string());
 
     let spec_value = run.data.get("spec").cloned()
         .unwrap_or(Value::Object(Default::default()));
@@ -285,43 +186,17 @@ pub async fn reconcile_customrun(
 
             let task = build_owned_remote_task(&run, &name, &ns, task_spec);
             let created = remote_tasks.create(&PostParams::default(), &task).await?;
-            let remote_task_uid = created.uid().unwrap_or_default();
 
-            println!("[customrun-controller] created RemoteTask {ns}/{name} uid={remote_task_uid}");
-
-            if let Err(e) = create_log_mirror_pod_by_name(
-                &ctx.client, &ns, &name, remote_task_uid.clone(),
-            ).await {
-                eprintln!("[customrun-controller] failed to create log-mirror pod: {e}");
-            }
-
-            emit_event(
-                &ctx.client, &ns, &object_ref_for(&run),
-                "Normal", "RemoteTaskCreated",
-                &format!("Created RemoteTask {name} from CustomRun params"),
-            ).await?;
+            println!("[customrun-controller] created RemoteTask {ns}/{name}");
 
             set_customrun_running(&customruns, &name).await?;
 
-            let task_ref = ObjectReference {
-                api_version: Some("gingersociety.org/v1alpha1".to_string()),
-                kind: Some("RemoteTask".to_string()),
-                name: Some(name.clone()),
-                namespace: Some(ns.clone()),
-                uid: Some(remote_task_uid),
-                ..Default::default()
-            };
-            let customrun_ref = object_ref_for(&run);
-
             tokio::spawn(run_dispatch(
                 ctx.client.clone(),
-                ctx.http.clone(),
                 ctx.sidekick_url.clone(),
                 ns.clone(),
                 name.clone(),
                 created,
-                task_ref,
-                Some(customrun_ref),
             ));
         }
     }
@@ -435,9 +310,8 @@ async fn patch_status(
     if is_terminal {
         status["completionTime"] = json!(rfc3339_now());
     }
-    let patch = json!({ "status": status });
     customruns
-        .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .patch_status(name, &PatchParams::default(), &Patch::Merge(&json!({ "status": status })))
         .await?;
     Ok(())
 }
@@ -459,35 +333,22 @@ fn build_owned_remote_task(
     ns: &str,
     spec: RemoteTaskSpec,
 ) -> RemoteTask {
-    let owner = OwnerReference {
-        api_version: format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}"),
-        kind: CUSTOMRUN_KIND.to_string(),
-        name: run.name_any(),
-        uid: run.uid().unwrap_or_default(),
-        controller: Some(true),
-        block_owner_deletion: Some(true),
-    };
-
     RemoteTask {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(ns.to_string()),
-            owner_references: Some(vec![owner]),
+            owner_references: Some(vec![OwnerReference {
+                api_version: format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}"),
+                kind: CUSTOMRUN_KIND.to_string(),
+                name: run.name_any(),
+                uid: run.uid().unwrap_or_default(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]),
             ..Default::default()
         },
         spec,
         status: None,
-    }
-}
-
-fn object_ref_for(run: &DynamicObject) -> ObjectReference {
-    ObjectReference {
-        api_version: Some(format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}")),
-        kind: Some(CUSTOMRUN_KIND.to_string()),
-        name: Some(run.name_any()),
-        namespace: run.metadata.namespace.clone(),
-        uid: run.uid(),
-        ..Default::default()
     }
 }
 

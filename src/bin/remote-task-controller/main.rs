@@ -13,6 +13,7 @@ use ginger_infra::remote_task::{RemoteTask, RemoteTaskPhase};
 mod customrun;
 mod dispatch;
 mod events;
+mod rpc;
 
 use customrun::{
     customrun_error_policy, reconcile_customrun, CustomRunContext, CUSTOMRUN_GROUP,
@@ -29,8 +30,6 @@ enum ReconcileError {
 
 struct ControllerContext {
     client: Client,
-    http: reqwest::Client,
-    sidekick_url: String,
 }
 
 #[tokio::main]
@@ -45,11 +44,7 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
 
     let remote_tasks: Api<RemoteTask> = Api::all(client.clone());
-    let ctx = Arc::new(ControllerContext {
-        client: client.clone(),
-        http: reqwest::Client::new(),
-        sidekick_url: sidekick_url.clone(),
-    });
+    let ctx = Arc::new(ControllerContext { client: client.clone() });
 
     let customrun_ar = ApiResource {
         group: CUSTOMRUN_GROUP.to_string(),
@@ -61,26 +56,17 @@ async fn main() -> anyhow::Result<()> {
     let customruns: Api<DynamicObject> = Api::all_with(client.clone(), &customrun_ar);
     let customrun_ctx = Arc::new(CustomRunContext {
         client: client.clone(),
-        http: reqwest::Client::new(),
         sidekick_url: sidekick_url.clone(),
     });
 
-    println!("[tekton-controller] watching RemoteTask across all namespaces");
-    println!(
-        "[tekton-controller] watching CustomRun (tekton.dev/v1beta1) across all namespaces"
-    );
+    println!("[tekton-controller] watching RemoteTask and CustomRun across all namespaces");
 
-    // RemoteTask controller — only handles terminal logging now;
-    // dispatch is driven from the CustomRun reconciler to avoid the
-    // Pending-phase race condition.
     let remote_task_controller = Controller::new(remote_tasks, watcher::Config::default())
         .run(reconcile_remote_task, error_policy, ctx)
         .for_each(|res| async move {
             match res {
                 Ok(o) => println!("[tekton-controller] reconciled remotetask {:?}", o),
-                Err(e) => {
-                    eprintln!("[tekton-controller] remotetask reconcile error: {:?}", e)
-                }
+                Err(e) => eprintln!("[tekton-controller] remotetask reconcile error: {:?}", e),
             }
         });
 
@@ -93,10 +79,7 @@ async fn main() -> anyhow::Result<()> {
         Api::<RemoteTask>::all(client.clone()),
         watcher::Config::default(),
         move |rt| {
-            let owner = rt
-                .metadata
-                .owner_references
-                .as_ref()?
+            let owner = rt.metadata.owner_references.as_ref()?
                 .iter()
                 .find(|o| o.kind == "CustomRun")?;
 
@@ -111,12 +94,7 @@ async fn main() -> anyhow::Result<()> {
                         plural: CUSTOMRUN_PLURAL.to_string(),
                     },
                 )
-                .within(
-                    rt.metadata
-                        .namespace
-                        .as_deref()
-                        .unwrap_or("default"),
-                ),
+                .within(rt.metadata.namespace.as_deref().unwrap_or("default")),
             )
         },
     )
@@ -124,9 +102,7 @@ async fn main() -> anyhow::Result<()> {
     .for_each(|res| async move {
         match res {
             Ok(o) => println!("[tekton-controller] reconciled customrun {:?}", o),
-            Err(e) => {
-                eprintln!("[tekton-controller] customrun reconcile error: {:?}", e)
-            }
+            Err(e) => eprintln!("[tekton-controller] customrun reconcile error: {:?}", e),
         }
     });
 
@@ -144,47 +120,15 @@ fn error_policy(
     Action::requeue(std::time::Duration::from_secs(REQUEUE_AFTER_ERROR_SECS))
 }
 
-// RemoteTask reconciler — now intentionally minimal.
-// Dispatch happens in the CustomRun reconciler to avoid the race where
-// the RemoteTask watcher fires after the job has already completed.
 async fn reconcile_remote_task(
     task: Arc<RemoteTask>,
     _ctx: Arc<ControllerContext>,
 ) -> Result<Action, ReconcileError> {
     let name = task.name_any();
     let ns = task.namespace().unwrap_or_else(|| "default".to_string());
+    let phase = task.status.as_ref().map(|s| s.phase.clone()).unwrap_or_default();
 
-    let phase = task
-        .status
-        .as_ref()
-        .map(|s| s.phase.clone())
-        .unwrap_or_default();
-
-    println!(
-        "[tekton-controller] reconcile remotetask {}/{} phase={:?}",
-        ns, name, phase
-    );
-
-    // Dispatch is now handled by the CustomRun reconciler via tokio::spawn.
-    // This reconciler exists only to log phase transitions and allow the
-    // .watches() cross-trigger on the CustomRun controller to work.
-    match phase {
-        RemoteTaskPhase::Pending => {
-            println!(
-                "[tekton-controller] {}/{} Pending — dispatch handled by customrun reconciler",
-                ns, name
-            );
-        }
-        RemoteTaskPhase::Running => {
-            println!("[tekton-controller] {}/{} Running", ns, name);
-        }
-        RemoteTaskPhase::Succeeded => {
-            println!("[tekton-controller] {}/{} Succeeded", ns, name);
-        }
-        RemoteTaskPhase::Failed => {
-            println!("[tekton-controller] {}/{} Failed", ns, name);
-        }
-    }
+    println!("[tekton-controller] remotetask {}/{} phase={:?}", ns, name, phase);
 
     Ok(Action::await_change())
 }
