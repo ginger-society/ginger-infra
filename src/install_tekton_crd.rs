@@ -87,6 +87,18 @@ rules:
     verbs: ["get", "update", "patch"]
   - apiGroups: [""]
     resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs/status"]
     verbs: ["get"]
   - apiGroups: ["tekton.dev"]
     resources: ["customruns"]
@@ -146,6 +158,11 @@ spec:
           env:
             - name: SIDEKICK_URL
               value: "{sidekick_url}"
+            # RUNNER_IMAGE controls which image the execution Jobs run.
+            # Defaults to gingersociety/external-executor-runner:latest if
+            # unset — override here if you need a pinned version.
+            # - name: RUNNER_IMAGE
+            #   value: "gingersociety/external-executor-runner:latest"
 "#,
         name = CONTROLLER_NAME,
         ns = CONTROLLER_NAMESPACE,
@@ -171,7 +188,8 @@ fn kubectl_apply_stdin(content: &str, env_vars: &HashMap<String, String>) -> any
 
     if let Some(stdin) = child.stdin.take() {
         let mut stdin = stdin;
-        stdin.write_all(content.as_bytes())
+        stdin
+            .write_all(content.as_bytes())
             .map_err(|e| anyhow::anyhow!("Failed to write to kubectl stdin: {}", e))?;
     }
 

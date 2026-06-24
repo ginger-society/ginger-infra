@@ -1,4 +1,4 @@
-name: Build, Push Docker Image, and Restart Deployment
+name: Build and Push Runner Docker Image
 
 on:
   workflow_dispatch:
@@ -28,19 +28,17 @@ jobs:
       run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
       continue-on-error: false
 
-    
-
     # - name: Update pipeline to running
     #   run: ginger-connector update-pipeline stage running
 
     # - name: Fetch the latest version of internal packages
     #   run: ginger-connector refresh
-    
+
     - name: Build Docker image
-      run: docker build --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }}  -t gingersociety/remote-task-controller:latest . -f Dockerfile.tekton-controller
+      run: docker build --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} -t gingersociety/external-executor-runner:latest . -f Dockerfile.runner
 
     - name: Push Docker image
-      run: docker push gingersociety/remote-task-controller:latest
+      run: docker push gingersociety/external-executor-runner:latest
       continue-on-error: false
 
     # - name: Update pipeline to passing
