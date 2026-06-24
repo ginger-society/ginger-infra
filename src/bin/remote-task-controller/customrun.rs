@@ -6,46 +6,33 @@
 //!     apiVersion: gingersociety.org/v1alpha1
 //!     kind: RemoteTask
 //!
-//! ## Why no TaskRun
+//! This reconciler:
+//!   1. Creates a TaskRun labelled with the CustomRun name.
+//!   2. Polls the TaskRun by label to mirror status back onto the CustomRun.
 //!
-//! Creating a *TaskRun* from inside a CustomRun reconciler causes two problems:
+//! NOTE: Tekton does NOT create its own TaskRun for a CustomRun step — that
+//! is the whole point of the CustomRun extension mechanism. The controller
+//! owns the TaskRun entirely. Tekton just watches the CustomRun status.
 //!
-//!   1. Tekton itself also creates a TaskRun for the CustomRun step (named with
-//!      a generated suffix). That TaskRun is stuck Pending forever because
-//!      Tekton is waiting for the CustomRun's status to go terminal — which
-//!      never happens because the controller is watching *its own* TaskRun
-//!      instead of updating the CustomRun.
-//!
-//!   2. The pipeline view always shows the Tekton-created TaskRun (Pending),
-//!      not the controller-created one (Succeeded).
-//!
-//! The correct pattern for a CustomRun controller is:
-//!
-//!   - Run the actual work yourself (here: a Kubernetes Job).
-//!   - Poll the Job for completion.
-//!   - Patch the CustomRun status directly when the Job finishes.
-//!
-//! Tekton sees the CustomRun go terminal and marks the pipeline step done.
+//! The TaskRun this controller creates is named <customrun-name>-exec and
+//! labelled `remotetask-customrun: <customrun-name>`.
+//! The label key has NO slash — slashes in label keys are valid in Kubernetes
+//! but the kube-rs ListParams label selector does not escape them, causing the
+//! API server to reject the selector with a 400. Use a plain key instead.
 
 use std::sync::Arc;
 
-use k8s_openapi::{
-    api::{
-        batch::v1::{Job, JobSpec},
-        core::v1::{
-            Container, EnvVar, EnvVarSource, PodSpec, PodTemplateSpec, SecretKeySelector,
-            Volume, VolumeMount,
-        },
-    },
-    apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time},
-};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
-    api::{Api, DynamicObject, Patch, PatchParams, PostParams},
+    api::{Api, DynamicObject, ListParams, Patch, PatchParams},
+    discovery::ApiResource,
     runtime::controller::Action,
     Client, ResourceExt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::taskrun::{create_taskrun, TaskRunSpec};
 
 pub const CUSTOMRUN_GROUP: &str = "tekton.dev";
 pub const CUSTOMRUN_VERSION: &str = "v1beta1";
@@ -56,11 +43,8 @@ const OUR_GROUP: &str = "gingersociety.org";
 const OUR_VERSION: &str = "v1alpha1";
 const OUR_KIND: &str = "RemoteTask";
 
-/// Label stamped on every Job we create so we can find it by label.
-const CUSTOMRUN_LABEL: &str = "remote-task-controller/customrun";
-
-const RUNNER_IMAGE_ENV: &str = "RUNNER_IMAGE";
-const DEFAULT_RUNNER_IMAGE: &str = "gingersociety/external-executor-runner:latest";
+// No slash in the label key — avoids kube-rs label selector escaping issues.
+const CUSTOMRUN_LABEL: &str = "remotetask-customrun";
 
 const REQUEUE_AFTER_ERROR_SECS: u64 = 15;
 const REQUEUE_WHILE_RUNNING_SECS: u64 = 5;
@@ -81,6 +65,8 @@ pub enum CustomRunError {
     Kube(#[from] kube::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("taskrun: {0}")]
+    TaskRun(#[from] crate::taskrun::TaskRunError),
     #[error("customRun '{0}' is missing spec.customRef")]
     MissingCustomRef(String),
     #[error("param parse: {0}")]
@@ -145,14 +131,14 @@ struct ParsedSpec {
     capability: String,
     script: String,
     cleanup: Option<String>,
-    env: Vec<EnvVar>,
+    env: Vec<serde_json::Value>,
 }
 
 fn parse_params(params: &[Param]) -> Result<ParsedSpec, CustomRunError> {
     let mut capability: Option<String> = None;
     let mut script: Option<String> = None;
     let mut cleanup: Option<String> = None;
-    let mut env_json: Vec<serde_json::Value> = Vec::new();
+    let mut env: Vec<serde_json::Value> = Vec::new();
 
     for p in params {
         match p.name.as_str() {
@@ -163,19 +149,11 @@ fn parse_params(params: &[Param]) -> Result<ParsedSpec, CustomRunError> {
                 if let Some(raw) = p.value.as_str() {
                     let parsed: Vec<serde_json::Value> = serde_yaml::from_str(raw)
                         .map_err(|e| CustomRunError::ParamParse(format!("env: {e}")))?;
-                    env_json = parsed;
+                    env = parsed;
                 }
             }
             other => eprintln!("[customrun] ignoring unrecognized param '{other}'"),
         }
-    }
-
-    // Convert JSON env entries to typed k8s EnvVar structs.
-    let mut env: Vec<EnvVar> = Vec::new();
-    for v in env_json {
-        let ev: EnvVar = serde_json::from_value(v)
-            .map_err(|e| CustomRunError::ParamParse(format!("env entry: {e}")))?;
-        env.push(ev);
     }
 
     Ok(ParsedSpec {
@@ -227,22 +205,23 @@ pub async fn reconcile_customrun(
 
     let customruns = customrun_api(&ctx.client, &ns);
 
-    // Look up OUR Job by label.
-    let our_job = find_our_job(&ctx.client, &ns, &name).await?;
+    // Look up OUR TaskRun by label (no slash in key = no selector escaping).
+    let our_taskrun = find_our_taskrun(&ctx.client, &ns, &name).await?;
 
-    match our_job {
-        Some(job) => {
-            // Job exists — sync its status onto the CustomRun.
-            let terminal = sync_status_from_job(&customruns, &name, &job).await?;
+    match our_taskrun {
+        Some(taskrun) => {
+            // TaskRun exists — sync its status onto the CustomRun.
+            let terminal = sync_status_from_taskrun(&customruns, &name, &taskrun).await?;
             if terminal {
                 return Ok(Action::await_change());
             }
+            // Still running — keep polling.
             Ok(Action::requeue(std::time::Duration::from_secs(
                 REQUEUE_WHILE_RUNNING_SECS,
             )))
         }
         None => {
-            // No Job yet — parse params and create one.
+            // No TaskRun yet — parse params and create one.
             let parsed = match parse_params(&spec.params) {
                 Ok(p) => p,
                 Err(e) => {
@@ -251,13 +230,30 @@ pub async fn reconcile_customrun(
                 }
             };
 
-            let job_name = format!("{name}-exec");
+            let taskrun_name = format!("{name}-exec");
             let owner_uid = run.uid().unwrap_or_default();
 
-            if let Err(e) =
-                create_job(&ctx, &ns, &job_name, &name, &owner_uid, parsed).await
-            {
-                set_failed(&customruns, &name, &format!("failed to create Job: {e}")).await?;
+            let mut extra_labels = std::collections::BTreeMap::new();
+            extra_labels.insert(CUSTOMRUN_LABEL.to_string(), name.clone());
+
+            let taskrun_spec = TaskRunSpec {
+                name: &taskrun_name,
+                ns: &ns,
+                owner_api_version: &format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}"),
+                owner_kind: CUSTOMRUN_KIND,
+                owner_name: &name,
+                owner_uid: &owner_uid,
+                capability: &parsed.capability,
+                script: &parsed.script,
+                cleanup: parsed.cleanup.as_deref(),
+                env: parsed.env,
+                sidekick_url: &ctx.sidekick_url,
+                auth_secret_name: &ctx.auth_secret_name,
+                extra_labels,
+            };
+
+            if let Err(e) = create_taskrun(&ctx.client, taskrun_spec).await {
+                set_failed(&customruns, &name, &format!("failed to create TaskRun: {e}")).await?;
                 return Ok(Action::await_change());
             }
 
@@ -279,150 +275,86 @@ pub fn customrun_error_policy(
     Action::requeue(std::time::Duration::from_secs(REQUEUE_AFTER_ERROR_SECS))
 }
 
-// ── Job creation ──────────────────────────────────────────────────────────────
+// ── TaskRun lookup ────────────────────────────────────────────────────────────
 
-async fn create_job(
-    ctx: &CustomRunContext,
-    ns: &str,
-    job_name: &str,
-    customrun_name: &str,
-    owner_uid: &str,
-    parsed: ParsedSpec,
-) -> Result<(), CustomRunError> {
-    let runner_image = std::env::var(RUNNER_IMAGE_ENV)
-        .unwrap_or_else(|_| DEFAULT_RUNNER_IMAGE.into());
-
-    // Build env: user-supplied first, then controller-managed vars appended so
-    // they cannot be accidentally shadowed.
-    let mut env = parsed.env;
-    env.extend([
-        EnvVar { name: "REMOTE_SCRIPT".into(),         value: Some(parsed.script),           value_from: None },
-        EnvVar { name: "REMOTE_CAPABILITY".into(),     value: Some(parsed.capability),       value_from: None },
-        EnvVar { name: "EXTERNAL_EXECUTOR_URL".into(), value: Some(ctx.sidekick_url.clone()), value_from: None },
-    ]);
-    if let Some(cleanup) = parsed.cleanup {
-        env.push(EnvVar { name: "REMOTE_CLEANUP".into(), value: Some(cleanup), value_from: None });
-    }
-
-    let mut labels = std::collections::BTreeMap::new();
-    labels.insert("app.kubernetes.io/managed-by".to_string(), "remote-task-controller".to_string());
-    labels.insert(CUSTOMRUN_LABEL.to_string(), customrun_name.to_string());
-
-    let job = Job {
-        metadata: ObjectMeta {
-            name: Some(job_name.to_string()),
-            namespace: Some(ns.to_string()),
-            labels: Some(labels.clone()),
-            owner_references: Some(vec![OwnerReference {
-                api_version: format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}"),
-                kind: CUSTOMRUN_KIND.to_string(),
-                name: customrun_name.to_string(),
-                uid: owner_uid.to_string(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            }]),
-            ..Default::default()
-        },
-        spec: Some(JobSpec {
-            backoff_limit: Some(0),
-            template: PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(labels),
-                    ..Default::default()
-                }),
-                spec: Some(PodSpec {
-                    restart_policy: Some("Never".to_string()),
-                    containers: vec![Container {
-                        name: "run".to_string(),
-                        image: Some(runner_image),
-                        env: Some(env),
-                        volume_mounts: Some(vec![VolumeMount {
-                            name: "ginger-auth".to_string(),
-                            mount_path: "/var/run/ginger-society".to_string(),
-                            read_only: Some(true),
-                            ..Default::default()
-                        }]),
-                        ..Default::default()
-                    }],
-                    volumes: Some(vec![Volume {
-                        name: "ginger-auth".to_string(),
-                        secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
-                            secret_name: Some(ctx.auth_secret_name.clone()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }]),
-                    ..Default::default()
-                }),
-            },
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), ns);
-    match jobs.create(&PostParams::default(), &job).await {
-        Ok(_) => {
-            println!("[customrun] created Job {ns}/{job_name}");
-            Ok(())
-        }
-        Err(kube::Error::Api(ae)) if ae.code == 409 => {
-            println!("[customrun] Job {ns}/{job_name} already exists, skipping");
-            Ok(())
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-// ── Job lookup ────────────────────────────────────────────────────────────────
-
-async fn find_our_job(
+async fn find_our_taskrun(
     client: &Client,
     ns: &str,
     customrun_name: &str,
-) -> Result<Option<Job>, CustomRunError> {
-    use kube::api::ListParams;
-    let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
+) -> Result<Option<DynamicObject>, CustomRunError> {
+    let ar = ApiResource {
+        group: "tekton.dev".into(),
+        version: "v1".into(),
+        api_version: "tekton.dev/v1".into(),
+        kind: "TaskRun".into(),
+        plural: "taskruns".into(),
+    };
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &ar);
     let lp = ListParams::default()
         .labels(&format!("{CUSTOMRUN_LABEL}={customrun_name}"));
-    let list = jobs.list(&lp).await?;
+
+    let list = api.list(&lp).await?;
+
+    if list.items.is_empty() {
+        println!("[customrun] no TaskRun found with label {CUSTOMRUN_LABEL}={customrun_name}");
+    } else {
+        println!(
+            "[customrun] found TaskRun '{}' for customrun '{customrun_name}'",
+            list.items[0].name_any()
+        );
+    }
+
     Ok(list.items.into_iter().next())
 }
 
 // ── status sync ───────────────────────────────────────────────────────────────
 
-/// Mirror the Job's status onto the CustomRun.
-/// Returns true if the CustomRun is now in a terminal state.
-async fn sync_status_from_job(
+async fn sync_status_from_taskrun(
     customruns: &Api<DynamicObject>,
     customrun_name: &str,
-    job: &Job,
+    taskrun: &DynamicObject,
 ) -> Result<bool, CustomRunError> {
-    let status = job.status.as_ref();
+    let conditions = taskrun
+        .data
+        .get("status")
+        .and_then(|s| s.get("conditions"))
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
 
-    // Job succeeded: .status.succeeded >= 1
-    if status.and_then(|s| s.succeeded).unwrap_or(0) >= 1 {
-        set_succeeded(customruns, customrun_name).await?;
-        return Ok(true);
+    let succeeded = conditions
+        .iter()
+        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Succeeded"));
+
+    match succeeded {
+        None => {
+            println!("[customrun] TaskRun for '{customrun_name}' has no Succeeded condition yet");
+            set_running(customruns, customrun_name).await?;
+            Ok(false)
+        }
+        Some(c) => {
+            let status = c.get("status").and_then(|s| s.as_str()).unwrap_or("Unknown");
+            println!("[customrun] TaskRun for '{customrun_name}' Succeeded={status}");
+            match status {
+                "True" => {
+                    set_succeeded(customruns, customrun_name).await?;
+                    Ok(true)
+                }
+                "False" => {
+                    let msg = c
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("TaskRun failed");
+                    set_failed(customruns, customrun_name, msg).await?;
+                    Ok(true)
+                }
+                _ => {
+                    set_running(customruns, customrun_name).await?;
+                    Ok(false)
+                }
+            }
+        }
     }
-
-    // Job failed: .status.failed >= 1 and backoff exhausted (backoffLimit=0)
-    if status.and_then(|s| s.failed).unwrap_or(0) >= 1 {
-        // Pull message from the job condition if available.
-        let msg = job
-            .status
-            .as_ref()
-            .and_then(|s| s.conditions.as_ref())
-            .and_then(|conds| conds.iter().find(|c| c.type_ == "Failed"))
-            .and_then(|c| c.message.clone())
-            .unwrap_or_else(|| "Job failed".to_string());
-        set_failed(customruns, customrun_name, &msg).await?;
-        return Ok(true);
-    }
-
-    // Still running.
-    set_running(customruns, customrun_name).await?;
-    Ok(false)
 }
 
 // ── status patchers ───────────────────────────────────────────────────────────
@@ -435,7 +367,7 @@ async fn set_running(customruns: &Api<DynamicObject>, name: &str) -> Result<(), 
             type_: "Succeeded".into(),
             status: "Unknown".into(),
             reason: "Running".into(),
-            message: "Job is running".into(),
+            message: "TaskRun is running".into(),
             last_transition_time: Some(now()),
         },
         false,
@@ -453,8 +385,8 @@ async fn set_succeeded(
         CustomRunCondition {
             type_: "Succeeded".into(),
             status: "True".into(),
-            reason: "JobSucceeded".into(),
-            message: "Job completed successfully".into(),
+            reason: "TaskRunSucceeded".into(),
+            message: "TaskRun completed successfully".into(),
             last_transition_time: Some(now()),
         },
         true,
@@ -473,7 +405,7 @@ async fn set_failed(
         CustomRunCondition {
             type_: "Succeeded".into(),
             status: "False".into(),
-            reason: "JobFailed".into(),
+            reason: "TaskRunFailed".into(),
             message: message.to_string(),
             last_transition_time: Some(now()),
         },
@@ -516,7 +448,7 @@ fn is_terminal(run: &DynamicObject) -> bool {
 }
 
 fn customrun_api(client: &Client, ns: &str) -> Api<DynamicObject> {
-    let ar = kube::discovery::ApiResource {
+    let ar = ApiResource {
         group: CUSTOMRUN_GROUP.to_string(),
         version: CUSTOMRUN_VERSION.to_string(),
         api_version: format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}"),
