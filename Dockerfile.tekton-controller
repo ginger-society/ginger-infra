@@ -1,5 +1,11 @@
+# Dockerfile.tekton-controller
+#
+# Builds the remote-task-controller binary.
+# The controller's only job is: watch RemoteTask → create TaskRun.
+# It does no HTTP work and holds no sidekick connection.
+
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM gingersociety/rust-rocket-api-builder:latest as builder
+FROM gingersociety/rust-rocket-api-builder:latest AS builder
 
 WORKDIR /build
 ARG GINGER_TOKEN
@@ -26,7 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin controller
 
-COPY --from=builder /build/target/release/remote-task-controller /usr/local/bin/remote-task-controller
+COPY --from=builder /build/target/release/remote-task-controller \
+    /usr/local/bin/remote-task-controller
 
 USER 10001
 

@@ -11,7 +11,10 @@ const DEFAULT_CONTROLLER_IMAGE: &str = "gingersociety/remote-task-controller:lat
 const CONTROLLER_NAMESPACE: &str = "tekton-pipelines";
 const CONTROLLER_NAME: &str = "remote-task-controller";
 
-pub fn run_install_tekton_crd(image: Option<&str>, sidekick_url: Option<&str>) -> anyhow::Result<()> {
+pub fn run_install_tekton_crd(
+    image: Option<&str>,
+    sidekick_url: Option<&str>,
+) -> anyhow::Result<()> {
     let sidekick_url = sidekick_url
         .ok_or_else(|| anyhow::anyhow!("--sidekick-url is required"))?;
 
@@ -25,7 +28,10 @@ pub fn run_install_tekton_crd(image: Option<&str>, sidekick_url: Option<&str>) -
 
     let controller_image = image.unwrap_or(DEFAULT_CONTROLLER_IMAGE);
     let deployment_yaml = render_deployment(controller_image, sidekick_url);
-    println!("  ✓ Controller Deployment generated (image: {})", controller_image);
+    println!(
+        "  ✓ Controller Deployment generated (image: {})",
+        controller_image
+    );
 
     let combined = format!(
         "{}\n---\n{}\n---\n{}",
@@ -52,8 +58,13 @@ pub fn run_install_tekton_crd(image: Option<&str>, sidekick_url: Option<&str>) -
     match kubectl_apply_stdin(&combined, &env_vars)? {
         true => {
             println!("\n✓ RemoteTask CRD, RBAC, and controller installed.");
-            println!("  Verify with: kubectl get crd remotetasks.gingersociety.org");
-            println!("  Verify with: kubectl -n {} get deployment {}", CONTROLLER_NAMESPACE, CONTROLLER_NAME);
+            println!(
+                "  Verify with: kubectl get crd remotetasks.gingersociety.org"
+            );
+            println!(
+                "  Verify with: kubectl -n {} get deployment {}",
+                CONTROLLER_NAMESPACE, CONTROLLER_NAME
+            );
             Ok(())
         }
         false => anyhow::bail!("kubectl apply failed — see output above"),
@@ -67,6 +78,16 @@ fn render_crd() -> anyhow::Result<String> {
 }
 
 fn render_rbac() -> String {
+    // The controller only needs permissions to:
+    //   - watch/patch RemoteTask (its own CRD)
+    //   - create/get TaskRuns (Tekton owns the rest)
+    //
+    // Removed vs old controller:
+    //   - secrets (no longer reads or creates them)
+    //   - configmaps (no longer creates them)
+    //   - events (Tekton emits its own)
+    //   - batch/jobs (no longer creates execution Jobs)
+    //   - tekton.dev/customruns (CustomRun bridging removed)
     format!(
         r#"apiVersion: v1
 kind: ServiceAccount
@@ -81,31 +102,13 @@ metadata:
 rules:
   - apiGroups: ["gingersociety.org"]
     resources: ["remotetasks"]
-    verbs: ["get", "list", "watch", "update", "patch", "create"]
+    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["gingersociety.org"]
     resources: ["remotetasks/status"]
     verbs: ["get", "update", "patch"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch", "get", "list", "watch"]
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
+  - apiGroups: ["tekton.dev"]
+    resources: ["taskruns"]
     verbs: ["get", "list", "watch", "create", "delete"]
-  - apiGroups: ["batch"]
-    resources: ["jobs/status"]
-    verbs: ["get"]
-  - apiGroups: ["tekton.dev"]
-    resources: ["customruns"]
-    verbs: ["get", "list", "watch", "update", "patch"]
-  - apiGroups: ["tekton.dev"]
-    resources: ["customruns/status"]
-    verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -158,9 +161,9 @@ spec:
           env:
             - name: SIDEKICK_URL
               value: "{sidekick_url}"
-            # RUNNER_IMAGE controls which image the execution Jobs run.
+            # RUNNER_IMAGE controls which image the TaskRun steps run.
             # Defaults to gingersociety/external-executor-runner:latest if
-            # unset — override here if you need a pinned version.
+            # unset — override here to pin a specific version.
             # - name: RUNNER_IMAGE
             #   value: "gingersociety/external-executor-runner:latest"
 "#,
@@ -171,7 +174,10 @@ spec:
     )
 }
 
-fn kubectl_apply_stdin(content: &str, env_vars: &HashMap<String, String>) -> anyhow::Result<bool> {
+fn kubectl_apply_stdin(
+    content: &str,
+    env_vars: &HashMap<String, String>,
+) -> anyhow::Result<bool> {
     let mut cmd = Command::new("kubectl");
     cmd.args(["apply", "-f", "-"]);
     cmd.stdin(Stdio::piped());
@@ -206,7 +212,10 @@ fn kubectl_apply_stdin(content: &str, env_vars: &HashMap<String, String>) -> any
         }
         Ok(true)
     } else {
-        eprintln!("  ✗ kubectl apply failed (exit {:?})", output.status.code());
+        eprintln!(
+            "  ✗ kubectl apply failed (exit {:?})",
+            output.status.code()
+        );
         for line in stderr.lines() {
             eprintln!("    {}", line);
         }

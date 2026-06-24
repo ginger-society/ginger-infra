@@ -1,165 +1,105 @@
+//! remote-task-controller
+//!
+//! Watches RemoteTask CRD objects and creates a Tekton TaskRun for each one.
+//! That is the *entire* job of this controller. Tekton owns the pod lifecycle,
+//! log streaming, dashboard integration, and pipeline view from that point on.
+//!
+//! Deleted vs the old controller:
+//!   - customrun.rs  (CustomRun bridging — gone, not needed)
+//!   - dispatch.rs   (in-process env resolution + HTTP to sidekick — gone)
+//!   - events.rs     (manual k8s Event emission — Tekton does this)
+//!   - job.rs        (Secret + ConfigMap + Job creation — gone)
+//!
+//! The runner pod (gingersociety/external-executor-runner) receives the script,
+//! cleanup script, capability, and env vars as environment variables injected
+//! directly into the TaskRun step spec. The entrypoint.sh in that image writes
+//! them to /tmp and delegates to `ginger-infra rpc`.
+
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use k8s_openapi::api::batch::v1::Job;
 use kube::{
-    api::{Api, DynamicObject},
+    api::{Api, DynamicObject, Patch, PatchParams, PostParams},
+    core::ObjectMeta,
     discovery::ApiResource,
     runtime::{controller::Action, watcher, Controller},
     Client, ResourceExt,
 };
+use serde_json::json;
 
 use ginger_infra::remote_task::{RemoteTask, RemoteTaskPhase, RemoteTaskStatus};
 
-mod customrun;
-mod dispatch;
-mod events;
-mod job;
-
-use customrun::{
-    customrun_error_policy, reconcile_customrun, CustomRunContext, CUSTOMRUN_GROUP,
-    CUSTOMRUN_KIND, CUSTOMRUN_PLURAL, CUSTOMRUN_VERSION,
-};
-use dispatch::{now, set_remote_task_status};
-use job::{classify_job_status, phase_for_outcome, JobOutcome};
-
 const REQUEUE_AFTER_ERROR_SECS: u64 = 30;
-const REQUEUE_WHILE_RUNNING_SECS: u64 = 5;
+const RUNNER_IMAGE_ENV: &str = "RUNNER_IMAGE";
+const DEFAULT_RUNNER_IMAGE: &str = "gingersociety/external-executor-runner:latest";
+
+// ── error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
-enum ReconcileError {
-    #[error("k8s api error: {0}")]
+enum Error {
+    #[error("kube: {0}")]
     Kube(#[from] kube::Error),
-    #[error("dispatch error: {0}")]
-    Dispatch(#[from] dispatch::DispatchError),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
-struct ControllerContext {
+// ── shared context ────────────────────────────────────────────────────────────
+
+struct Ctx {
     client: Client,
+    sidekick_url: String,
 }
+
+// ── entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!("[tekton-controller] starting...");
+    println!("[remote-task-controller] starting...");
 
-    // SIDEKICK_URL is still required — it's read by job.rs when building the
-    // execution Job's pod spec (EXTERNAL_EXECUTOR_URL env var for the
-    // `ginger-infra rpc` runner container), not used by the controller
-    // process itself.
     let sidekick_url = std::env::var("SIDEKICK_URL")
         .map_err(|_| anyhow::anyhow!("SIDEKICK_URL env var is required"))?;
-    println!("[tekton-controller] sidekick_url={} (passed to execution Jobs)", sidekick_url);
 
-    let client = Client::try_default().await?;
-
-    let remote_tasks: Api<RemoteTask> = Api::all(client.clone());
-    let ctx = Arc::new(ControllerContext {
-        client: client.clone(),
-    });
-
-    let customrun_ar = ApiResource {
-        group: CUSTOMRUN_GROUP.to_string(),
-        version: CUSTOMRUN_VERSION.to_string(),
-        api_version: format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}"),
-        kind: CUSTOMRUN_KIND.to_string(),
-        plural: CUSTOMRUN_PLURAL.to_string(),
-    };
-    let customruns: Api<DynamicObject> = Api::all_with(client.clone(), &customrun_ar);
-    let customrun_ctx = Arc::new(CustomRunContext {
-        client: client.clone(),
-    });
-
-    println!("[tekton-controller] watching RemoteTask + owned Jobs across all namespaces");
     println!(
-        "[tekton-controller] watching CustomRun (tekton.dev/v1beta1) across all namespaces"
+        "[remote-task-controller] sidekick_url={} (injected into TaskRun pods as EXTERNAL_EXECUTOR_URL)",
+        sidekick_url
     );
 
-    // RemoteTask controller — watches the execution Job it owns (created by
-    // the CustomRun reconciler) and mirrors that Job's status onto
-    // RemoteTask.status. This is the only place RemoteTask status is
-    // written; the controller does no execution of its own.
-    let remote_task_controller = Controller::new(remote_tasks, watcher::Config::default())
-        .owns(Api::<Job>::all(client.clone()), watcher::Config::default())
-        .run(reconcile_remote_task, error_policy, ctx)
-        .for_each(|res| async move {
-            match res {
-                Ok(o) => println!("[tekton-controller] reconciled remotetask {:?}", o),
-                Err(e) => {
-                    eprintln!("[tekton-controller] remotetask reconcile error: {:?}", e)
-                }
-            }
-        });
-
-    let customrun_controller = Controller::new_with(
-        customruns,
-        watcher::Config::default(),
-        customrun_ar.clone(),
-    )
-    .watches(
-        Api::<RemoteTask>::all(client.clone()),
-        watcher::Config::default(),
-        move |rt| {
-            let owner = rt
-                .metadata
-                .owner_references
-                .as_ref()?
-                .iter()
-                .find(|o| o.kind == "CustomRun")?;
-
-            Some(
-                kube::runtime::reflector::ObjectRef::<DynamicObject>::new_with(
-                    &owner.name,
-                    ApiResource {
-                        group: CUSTOMRUN_GROUP.to_string(),
-                        version: CUSTOMRUN_VERSION.to_string(),
-                        api_version: format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}"),
-                        kind: CUSTOMRUN_KIND.to_string(),
-                        plural: CUSTOMRUN_PLURAL.to_string(),
-                    },
-                )
-                .within(
-                    rt.metadata
-                        .namespace
-                        .as_deref()
-                        .unwrap_or("default"),
-                ),
-            )
-        },
-    )
-    .run(reconcile_customrun, customrun_error_policy, customrun_ctx)
-    .for_each(|res| async move {
-        match res {
-            Ok(o) => println!("[tekton-controller] reconciled customrun {:?}", o),
-            Err(e) => {
-                eprintln!("[tekton-controller] customrun reconcile error: {:?}", e)
-            }
-        }
+    let client = Client::try_default().await?;
+    let ctx = Arc::new(Ctx {
+        client: client.clone(),
+        sidekick_url,
     });
 
-    tokio::join!(remote_task_controller, customrun_controller);
+    println!("[remote-task-controller] watching RemoteTask across all namespaces");
+
+    Controller::new(
+        Api::<RemoteTask>::all(client),
+        watcher::Config::default(),
+    )
+    .run(reconcile, error_policy, ctx)
+    .for_each(|result| async move {
+        match result {
+            Ok(obj) => println!("[remote-task-controller] reconciled {:?}", obj),
+            Err(e) => eprintln!("[remote-task-controller] reconcile error: {:?}", e),
+        }
+    })
+    .await;
 
     Ok(())
 }
 
-fn error_policy(
-    _task: Arc<RemoteTask>,
-    err: &ReconcileError,
-    _ctx: Arc<ControllerContext>,
-) -> Action {
-    eprintln!("[tekton-controller] error_policy: {:?}", err);
+// ── error policy ──────────────────────────────────────────────────────────────
+
+fn error_policy(_task: Arc<RemoteTask>, err: &Error, _ctx: Arc<Ctx>) -> Action {
+    eprintln!("[remote-task-controller] error_policy: {:?}", err);
     Action::requeue(std::time::Duration::from_secs(REQUEUE_AFTER_ERROR_SECS))
 }
 
-/// RemoteTask reconciler — looks up the execution Job (same name as the
-/// RemoteTask, created by the CustomRun reconciler), classifies its status,
-/// and patches RemoteTask.status to match. Pure observation: this function
-/// never runs a script and never calls the sidekick.
-async fn reconcile_remote_task(
-    task: Arc<RemoteTask>,
-    ctx: Arc<ControllerContext>,
-) -> Result<Action, ReconcileError> {
+// ── reconciler ────────────────────────────────────────────────────────────────
+
+async fn reconcile(task: Arc<RemoteTask>, ctx: Arc<Ctx>) -> Result<Action, Error> {
     let name = task.name_any();
-    let ns = task.namespace().unwrap_or_else(|| "default".to_string());
+    let ns = task.namespace().unwrap_or_else(|| "default".into());
 
     let current_phase = task
         .status
@@ -167,115 +107,165 @@ async fn reconcile_remote_task(
         .map(|s| s.phase.clone())
         .unwrap_or_default();
 
-    // Already terminal — nothing more to observe.
+    // Already handed off — Tekton owns it from here.
     if matches!(
         current_phase,
-        RemoteTaskPhase::Succeeded | RemoteTaskPhase::Failed
+        RemoteTaskPhase::Running | RemoteTaskPhase::Succeeded | RemoteTaskPhase::Failed
     ) {
         return Ok(Action::await_change());
     }
 
-    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
-    let job = match jobs.get_opt(&name).await? {
-        Some(j) => j,
-        None => {
-            // CustomRun reconciler hasn't created the Job yet (or it's been
-            // deleted out from under us). Nothing to do but wait.
-            println!(
-                "[tekton-controller] {}/{} — no execution Job yet, waiting",
-                ns, name
-            );
-            return Ok(Action::requeue(std::time::Duration::from_secs(
-                REQUEUE_WHILE_RUNNING_SECS,
-            )));
-        }
-    };
+    println!("[remote-task-controller] {ns}/{name} — creating TaskRun");
 
-    let outcome = match classify_job_status(job.status.as_ref()) {
-        Some(o) => o,
-        None => {
-            println!(
-                "[tekton-controller] {}/{} — Job exists, no status yet",
-                ns, name
-            );
-            return Ok(Action::requeue(std::time::Duration::from_secs(
-                REQUEUE_WHILE_RUNNING_SECS,
-            )));
-        }
-    };
+    let taskrun_api = taskrun_api(&ctx.client, &ns);
 
-    let new_phase = phase_for_outcome(&outcome);
-
-    println!(
-        "[tekton-controller] {}/{} phase={:?} → {:?}",
-        ns, name, current_phase, new_phase
-    );
-
-    match outcome {
-        JobOutcome::Running => {
-            if current_phase != RemoteTaskPhase::Running {
-                set_remote_task_status(
-                    &ctx.client,
-                    &ns,
-                    &name,
-                    RemoteTaskStatus {
-                        phase: RemoteTaskPhase::Running,
-                        start_time: Some(now()),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            }
-            Ok(Action::requeue(std::time::Duration::from_secs(
-                REQUEUE_WHILE_RUNNING_SECS,
-            )))
-        }
-        JobOutcome::Succeeded => {
-            // Job ran to completion successfully. We don't have a per-line
-            // exit code from the script itself (the runner pod's own exit
-            // code is 0 either way once the rpc subcommand returns cleanly),
-            // so exit_code 0 here reflects "the runner completed without
-            // error" — check the Job's pod logs for the script's own output.
-            set_remote_task_status(
-                &ctx.client,
-                &ns,
-                &name,
-                RemoteTaskStatus {
-                    phase: RemoteTaskPhase::Succeeded,
-                    exit_code: Some(0),
-                    completion_time: Some(now()),
-                    conditions: vec![ginger_infra::remote_task::RemoteTaskCondition {
-                        type_: "Succeeded".to_string(),
-                        status: "True".to_string(),
-                        reason: Some("JobCompleted".to_string()),
-                        message: Some("execution Job completed successfully".to_string()),
-                    }],
-                    ..Default::default()
-                },
-            )
-            .await?;
-            Ok(Action::await_change())
-        }
-        JobOutcome::Failed { message } => {
-            set_remote_task_status(
-                &ctx.client,
-                &ns,
-                &name,
-                RemoteTaskStatus {
-                    phase: RemoteTaskPhase::Failed,
-                    completion_time: Some(now()),
-                    message: Some(message.clone()),
-                    conditions: vec![ginger_infra::remote_task::RemoteTaskCondition {
-                        type_: "Succeeded".to_string(),
-                        status: "False".to_string(),
-                        reason: Some("JobFailed".to_string()),
-                        message: Some(message),
-                    }],
-                    ..Default::default()
-                },
-            )
-            .await?;
-            Ok(Action::await_change())
-        }
+    // Idempotent: if the TaskRun already exists we just mark ourselves running
+    // and stop watching — Tekton will finish it.
+    if taskrun_api.get_opt(&name).await?.is_none() {
+        create_taskrun(&ctx.client, &ns, &name, &task, &ctx.sidekick_url).await?;
+    } else {
+        println!(
+            "[remote-task-controller] {ns}/{name} — TaskRun already exists, skipping create"
+        );
     }
+
+    mark_running(&ctx.client, &ns, &name).await?;
+
+    Ok(Action::await_change())
+}
+
+// ── TaskRun creation ─────────────────────────────────────────────────────────
+
+/// Build and POST a Tekton TaskRun that runs the script inside the runner image.
+///
+/// The script, cleanup script, and capability are passed as environment
+/// variables. The runner image's entrypoint.sh writes them to /tmp and
+/// delegates to `ginger-infra rpc`. All env vars declared in RemoteTaskSpec
+/// (literal values or secretKeyRef) are forwarded directly into the step so
+/// Kubernetes handles secret injection — the controller never reads secret
+/// values itself.
+async fn create_taskrun(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    task: &RemoteTask,
+    sidekick_url: &str,
+) -> Result<(), Error> {
+    let runner_image = std::env::var(RUNNER_IMAGE_ENV)
+        .unwrap_or_else(|_| DEFAULT_RUNNER_IMAGE.into());
+
+    // Forward user-declared env vars. secretKeyRef entries are passed through
+    // verbatim so Kubernetes injects the value at pod start — the controller
+    // never decrypts them.
+    let mut step_env: Vec<serde_json::Value> = task.spec.env.iter().map(|e| {
+        if let Some(v) = &e.value {
+            json!({ "name": e.name, "value": v })
+        } else if let Some(from) = &e.value_from {
+            if let Some(sr) = &from.secret_key_ref {
+                json!({
+                    "name": e.name,
+                    "valueFrom": {
+                        "secretKeyRef": { "name": sr.name, "key": sr.key }
+                    }
+                })
+            } else {
+                json!({ "name": e.name, "value": "" })
+            }
+        } else {
+            json!({ "name": e.name, "value": "" })
+        }
+    }).collect();
+
+    // Controller-managed vars — appended after user vars so they can't be
+    // accidentally shadowed by a user-declared env entry with the same name.
+    step_env.extend([
+        json!({ "name": "REMOTE_SCRIPT",        "value": task.spec.script }),
+        json!({ "name": "REMOTE_CAPABILITY",    "value": task.spec.capability }),
+        json!({ "name": "EXTERNAL_EXECUTOR_URL","value": sidekick_url }),
+    ]);
+    if let Some(cleanup) = &task.spec.cleanup {
+        step_env.push(json!({ "name": "REMOTE_CLEANUP", "value": cleanup }));
+    }
+
+    let taskrun = json!({
+        "apiVersion": "tekton.dev/v1",
+        "kind": "TaskRun",
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            // Garbage-collect the TaskRun when the RemoteTask is deleted.
+            "ownerReferences": [{
+                "apiVersion": "gingersociety.org/v1alpha1",
+                "kind": "RemoteTask",
+                "name": name,
+                "uid": task.uid().unwrap_or_default(),
+                "controller": true,
+                "blockOwnerDeletion": true,
+            }],
+            "labels": {
+                "app.kubernetes.io/managed-by": "remote-task-controller",
+                "remotetask": name,
+            }
+        },
+        "spec": {
+            // Inline task spec — no Task CR needed in the cluster.
+            "taskSpec": {
+                "steps": [{
+                    "name": "run",
+                    "image": runner_image,
+                    // The runner's entrypoint.sh reads these env vars, writes
+                    // REMOTE_SCRIPT → /tmp/script.sh (+ REMOTE_CLEANUP if set),
+                    // then calls: ginger-infra rpc --envrc /dev/null --script …
+                    "env": step_env,
+                }]
+            }
+        }
+    });
+
+    let api = taskrun_api(client, ns);
+    let obj: DynamicObject = serde_json::from_value(taskrun)?;
+
+    match api.create(&PostParams::default(), &obj).await {
+        Ok(_) => {
+            println!("[remote-task-controller] created TaskRun {ns}/{name}");
+            Ok(())
+        }
+        Err(kube::Error::Api(ae)) if ae.code == 409 => {
+            println!("[remote-task-controller] TaskRun {ns}/{name} already exists");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+// ── status helpers ────────────────────────────────────────────────────────────
+
+/// Mark the RemoteTask as Running so we don't re-create the TaskRun on the
+/// next reconcile loop.
+async fn mark_running(client: &Client, ns: &str, name: &str) -> Result<(), Error> {
+    let api: Api<RemoteTask> = Api::namespaced(client.clone(), ns);
+    let status = RemoteTaskStatus {
+        phase: RemoteTaskPhase::Running,
+        start_time: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::now(),
+        )),
+        ..Default::default()
+    };
+    let patch = json!({ "status": status });
+    api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+
+fn taskrun_api(client: &Client, ns: &str) -> Api<DynamicObject> {
+    let ar = ApiResource {
+        group: "tekton.dev".into(),
+        version: "v1".into(),
+        api_version: "tekton.dev/v1".into(),
+        kind: "TaskRun".into(),
+        plural: "taskruns".into(),
+    };
+    Api::namespaced_with(client.clone(), ns, &ar)
 }

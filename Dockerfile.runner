@@ -1,5 +1,16 @@
+# Dockerfile.runner
+#
+# Builds the external-executor-runner image.
+# This is the image that Tekton TaskRun steps actually run.
+# It contains ginger-infra (for the `rpc` subcommand) and entrypoint.sh,
+# which writes REMOTE_SCRIPT / REMOTE_CLEANUP from env to /tmp and then
+# calls: ginger-infra rpc --envrc /dev/null --script /tmp/script.sh …
+#
+# The script, cleanup script, and all env vars are injected by the controller
+# directly into the TaskRun step spec — no ConfigMap or Secret mounts needed.
+
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM gingersociety/rust-rocket-api-builder:latest as builder
+FROM gingersociety/rust-rocket-api-builder:latest AS builder
 
 WORKDIR /build
 ARG GINGER_TOKEN
@@ -27,7 +38,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin runner
 
 COPY --from=builder /build/target/release/ginger-infra /usr/local/bin/ginger-infra
+COPY entrypoint.sh /entrypoint.sh
 
 USER 10001
 
-ENTRYPOINT ["/usr/local/bin/ginger-infra", "rpc"]
+ENTRYPOINT ["/entrypoint.sh"]

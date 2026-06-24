@@ -1,4 +1,4 @@
-name: Build, Push Docker Images, and Restart Deployment
+name: Build and push Docker images
 
 on:
   workflow_dispatch:
@@ -7,57 +7,44 @@ on:
       - main
 
 jobs:
+  # ── Controller image ────────────────────────────────────────────────────────
   build-and-push-controller:
     runs-on: ubuntu-22.04
-
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-    # - name: Install ginger-apps
-    #   run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/rust-helpers/install-pipeline-clis.sh)"
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
 
-    # - name: Authenticate with ginger-auth
-    #   id: ginger-auth
-    #   run: ginger-auth token-login ${{ secrets.GINGER_TOKEN }}
+      - name: Build controller image
+        run: |
+          docker build \
+            --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} \
+            -t gingersociety/remote-task-controller:latest \
+            -f Dockerfile.tekton-controller \
+            .
 
-    # - name: connect to prod schema service
-    #   run : ginger-connector connect prod
+      - name: Push controller image
+        run: docker push gingersociety/remote-task-controller:latest
 
-    - name: Log in to Docker Hub
-      run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
-      continue-on-error: false
-
-    # - name: Update pipeline to running
-    #   run: ginger-connector update-pipeline stage running
-
-    # - name: Fetch the latest version of internal packages
-    #   run: ginger-connector refresh
-
-    - name: Build Docker image
-      run: docker build --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} -t gingersociety/remote-task-controller:latest . -f Dockerfile.tekton-controller
-
-    - name: Push Docker image
-      run: docker push gingersociety/remote-task-controller:latest
-      continue-on-error: false
-
-    # - name: Update pipeline to passing
-    #   run: ginger-connector update-pipeline stage passing
-
+  # ── Runner image ────────────────────────────────────────────────────────────
   build-and-push-runner:
     runs-on: ubuntu-22.04
-
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-    - name: Log in to Docker Hub
-      run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
-      continue-on-error: false
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
 
-    - name: Build Docker image
-      run: docker build --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} -t gingersociety/external-executor-runner:latest . -f Dockerfile.runner
+      - name: Build runner image
+        run: |
+          docker build \
+            --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} \
+            -t gingersociety/external-executor-runner:latest \
+            -f Dockerfile.runner \
+            .
 
-    - name: Push Docker image
-      run: docker push gingersociety/external-executor-runner:latest
-      continue-on-error: false
+      - name: Push runner image
+        run: docker push gingersociety/external-executor-runner:latest
