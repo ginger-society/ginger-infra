@@ -6,20 +6,20 @@
 //!     apiVersion: gingersociety.org/v1alpha1
 //!     kind: RemoteTask
 //!
-//! This reconciler reads the CustomRun's params (capability, script, cleanup,
-//! env) and creates a Tekton TaskRun that runs the runner image. Status is
-//! then owned by Tekton — we just need to mark the CustomRun as Running once
-//! the TaskRun exists, and Succeeded/Failed when we can observe the TaskRun's
-//! own completion (or let Tekton's own signals propagate via the ownerRef).
+//! This reconciler:
+//!   1. Creates a TaskRun labelled with the CustomRun name.
+//!   2. Polls the TaskRun (by label, not by name — Tekton may create its own
+//!      TaskRun with a generated name) to mirror status back onto the CustomRun.
 //!
-//! Compared to the old implementation: no Job, no Secret, no ConfigMap,
-//! no SSE streaming, no log mirroring.
+//! The TaskRun this controller creates is named <customrun-name>-exec and
+//! labelled `remote-task-controller/customrun: <customrun-name>` so it can
+//! always be found unambiguously.
 
 use std::sync::Arc;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
-    api::{Api, DynamicObject, Patch, PatchParams},
+    api::{Api, DynamicObject, ListParams, Patch, PatchParams},
     discovery::ApiResource,
     runtime::controller::Action,
     Client, ResourceExt,
@@ -27,7 +27,7 @@ use kube::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::taskrun::{create_taskrun, taskrun_api, TaskRunSpec};
+use crate::taskrun::{create_taskrun, TaskRunSpec};
 
 pub const CUSTOMRUN_GROUP: &str = "tekton.dev";
 pub const CUSTOMRUN_VERSION: &str = "v1beta1";
@@ -37,6 +37,9 @@ pub const CUSTOMRUN_PLURAL: &str = "customruns";
 const OUR_GROUP: &str = "gingersociety.org";
 const OUR_VERSION: &str = "v1alpha1";
 const OUR_KIND: &str = "RemoteTask";
+
+// Label we stamp on every TaskRun we create so we can find it by label later.
+const CUSTOMRUN_LABEL: &str = "remote-task-controller/customrun";
 
 const REQUEUE_AFTER_ERROR_SECS: u64 = 15;
 const REQUEUE_WHILE_RUNNING_SECS: u64 = 5;
@@ -65,7 +68,7 @@ pub enum CustomRunError {
     ParamParse(String),
 }
 
-// ── CustomRun spec types (minimal, only what we need) ─────────────────────────
+// ── CustomRun spec types ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct CustomRunSpec {
@@ -123,7 +126,6 @@ struct ParsedSpec {
     capability: String,
     script: String,
     cleanup: Option<String>,
-    /// JSON env entries ready to embed in the TaskRun step spec.
     env: Vec<serde_json::Value>,
 }
 
@@ -135,24 +137,17 @@ fn parse_params(params: &[Param]) -> Result<ParsedSpec, CustomRunError> {
 
     for p in params {
         match p.name.as_str() {
-            "capability" => {
-                capability = p.value.as_str().map(str::to_string).or(capability)
-            }
-            "script" => script = p.value.as_str().map(str::to_string).or(script),
-            "cleanup" => cleanup = p.value.as_str().map(str::to_string).or(cleanup),
+            "capability" => capability = p.value.as_str().map(str::to_string).or(capability),
+            "script"     => script     = p.value.as_str().map(str::to_string).or(script),
+            "cleanup"    => cleanup    = p.value.as_str().map(str::to_string).or(cleanup),
             "env" => {
                 if let Some(raw) = p.value.as_str() {
-                    // The env param is a YAML list of {name, value} or
-                    // {name, valueFrom: {secretKeyRef: ...}} entries —
-                    // exactly the same shape as a Kubernetes EnvVar.
                     let parsed: Vec<serde_json::Value> = serde_yaml::from_str(raw)
                         .map_err(|e| CustomRunError::ParamParse(format!("env: {e}")))?;
                     env = parsed;
                 }
             }
-            other => {
-                eprintln!("[customrun] ignoring unrecognized param '{other}'");
-            }
+            other => eprintln!("[customrun] ignoring unrecognized param '{other}'"),
         }
     }
 
@@ -178,7 +173,6 @@ pub async fn reconcile_customrun(
         .clone()
         .unwrap_or_else(|| "default".to_string());
 
-    // Parse the spec
     let spec_value = run
         .data
         .get("spec")
@@ -199,62 +193,77 @@ pub async fn reconcile_customrun(
         return Ok(Action::await_change());
     }
 
-    // Already terminal — nothing to do
+    // Already terminal on the CustomRun itself — nothing more to do
     if is_terminal(&run) {
         return Ok(Action::await_change());
     }
 
     let customruns = customrun_api(&ctx.client, &ns);
 
-    // If the TaskRun already exists we are already running — just sync status
-    let taskrun_exists = taskrun_api(&ctx.client, &ns)
-        .get_opt(&name)
-        .await?
-        .is_some();
+    // Look up OUR TaskRun by label — not by name. Tekton may also create a
+    // TaskRun for this CustomRun with a generated name; we ignore that one
+    // and only track the one we created, identified by our label.
+    let our_taskrun = find_our_taskrun(&ctx.client, &ns, &name).await?;
 
-    if taskrun_exists {
-        // Sync TaskRun status → CustomRun status
-        sync_status(&customruns, &ctx.client, &ns, &name).await?;
-        return Ok(Action::requeue(std::time::Duration::from_secs(
-            REQUEUE_WHILE_RUNNING_SECS,
-        )));
-    }
-
-    // Parse params and create the TaskRun
-    let parsed = match parse_params(&spec.params) {
-        Ok(p) => p,
-        Err(e) => {
-            set_failed(&customruns, &name, &format!("invalid params: {e}")).await?;
-            return Ok(Action::await_change());
+    match our_taskrun {
+        Some(taskrun) => {
+            // TaskRun exists — sync its status onto the CustomRun
+            let terminal = sync_status_from_taskrun(&customruns, &name, &taskrun).await?;
+            if terminal {
+                // CustomRun is now terminal, stop requeuing
+                return Ok(Action::await_change());
+            }
+            // Still running — keep polling
+            Ok(Action::requeue(std::time::Duration::from_secs(
+                REQUEUE_WHILE_RUNNING_SECS,
+            )))
         }
-    };
+        None => {
+            // No TaskRun yet — parse params and create one
+            let parsed = match parse_params(&spec.params) {
+                Ok(p) => p,
+                Err(e) => {
+                    set_failed(&customruns, &name, &format!("invalid params: {e}")).await?;
+                    return Ok(Action::await_change());
+                }
+            };
 
-    let owner_uid = run.uid().unwrap_or_default();
+            // The TaskRun name is <customrun-name>-exec to avoid colliding
+            // with any TaskRun Tekton itself creates for the same CustomRun.
+            let taskrun_name = format!("{name}-exec");
+            let owner_uid = run.uid().unwrap_or_default();
 
-    let taskrun_spec = TaskRunSpec {
-        name: &name,
-        ns: &ns,
-        owner_api_version: &format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}"),
-        owner_kind: CUSTOMRUN_KIND,
-        owner_uid: owner_uid.as_str(),
-        capability: &parsed.capability,
-        script: &parsed.script,
-        cleanup: parsed.cleanup.as_deref(),
-        env: parsed.env,
-        sidekick_url: &ctx.sidekick_url,
-        auth_secret_name: &ctx.auth_secret_name,
-    };
+            let mut extra_labels = std::collections::BTreeMap::new();
+            extra_labels.insert(CUSTOMRUN_LABEL.to_string(), name.clone());
 
-    if let Err(e) = create_taskrun(&ctx.client, taskrun_spec).await {
-        set_failed(&customruns, &name, &format!("failed to create TaskRun: {e}")).await?;
-        return Ok(Action::await_change());
+            let taskrun_spec = TaskRunSpec {
+                name: &taskrun_name,
+                ns: &ns,
+                owner_api_version: &format!("{CUSTOMRUN_GROUP}/{CUSTOMRUN_VERSION}"),
+                owner_kind: CUSTOMRUN_KIND,
+                owner_name: &name,
+                owner_uid: &owner_uid,
+                capability: &parsed.capability,
+                script: &parsed.script,
+                cleanup: parsed.cleanup.as_deref(),
+                env: parsed.env,
+                sidekick_url: &ctx.sidekick_url,
+                auth_secret_name: &ctx.auth_secret_name,
+                extra_labels,
+            };
+
+            if let Err(e) = create_taskrun(&ctx.client, taskrun_spec).await {
+                set_failed(&customruns, &name, &format!("failed to create TaskRun: {e}")).await?;
+                return Ok(Action::await_change());
+            }
+
+            set_running(&customruns, &name).await?;
+
+            Ok(Action::requeue(std::time::Duration::from_secs(
+                REQUEUE_WHILE_RUNNING_SECS,
+            )))
+        }
     }
-
-    set_running(&customruns, &name).await?;
-
-    Ok(Action::requeue(std::time::Duration::from_secs(
-        REQUEUE_WHILE_RUNNING_SECS,
-    )))
 }
 
 pub fn customrun_error_policy(
@@ -266,35 +275,39 @@ pub fn customrun_error_policy(
     Action::requeue(std::time::Duration::from_secs(REQUEUE_AFTER_ERROR_SECS))
 }
 
-// ── status helpers ────────────────────────────────────────────────────────────
+// ── TaskRun lookup ────────────────────────────────────────────────────────────
 
-fn is_terminal(run: &DynamicObject) -> bool {
-    run.data
-        .get("status")
-        .and_then(|s| s.get("conditions"))
-        .and_then(|c| c.as_array())
-        .map(|conds| {
-            conds.iter().any(|c| {
-                c.get("type").and_then(|t| t.as_str()) == Some("Succeeded")
-                    && c.get("status").and_then(|s| s.as_str()) != Some("Unknown")
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// Read the TaskRun's status and mirror it onto the CustomRun.
-async fn sync_status(
-    customruns: &Api<DynamicObject>,
+/// Find the TaskRun we created for this CustomRun, identified by label.
+/// Returns None if not found yet.
+async fn find_our_taskrun(
     client: &Client,
     ns: &str,
-    name: &str,
-) -> Result<(), CustomRunError> {
-    let taskrun = match taskrun_api(client, ns).get_opt(name).await? {
-        Some(tr) => tr,
-        None => return Ok(()), // not yet visible
+    customrun_name: &str,
+) -> Result<Option<DynamicObject>, CustomRunError> {
+    let ar = ApiResource {
+        group: "tekton.dev".into(),
+        version: "v1".into(),
+        api_version: "tekton.dev/v1".into(),
+        kind: "TaskRun".into(),
+        plural: "taskruns".into(),
     };
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &ar);
+    let lp = ListParams::default()
+        .labels(&format!("{CUSTOMRUN_LABEL}={customrun_name}"));
 
-    // Read the TaskRun's Succeeded condition
+    let list = api.list(&lp).await?;
+    Ok(list.items.into_iter().next())
+}
+
+// ── status sync ───────────────────────────────────────────────────────────────
+
+/// Mirror the TaskRun's Succeeded condition onto the CustomRun.
+/// Returns true if the CustomRun is now in a terminal state.
+async fn sync_status_from_taskrun(
+    customruns: &Api<DynamicObject>,
+    customrun_name: &str,
+    taskrun: &DynamicObject,
+) -> Result<bool, CustomRunError> {
     let conditions = taskrun
         .data
         .get("status")
@@ -303,43 +316,46 @@ async fn sync_status(
         .cloned()
         .unwrap_or_default();
 
-    let succeeded_cond = conditions
+    let succeeded = conditions
         .iter()
         .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Succeeded"));
 
-    match succeeded_cond {
+    match succeeded {
         None => {
-            // TaskRun exists but no condition yet — still starting
-            set_running(customruns, name).await?;
+            // TaskRun exists but Tekton hasn't set a condition yet
+            set_running(customruns, customrun_name).await?;
+            Ok(false)
         }
         Some(c) => {
             let status = c.get("status").and_then(|s| s.as_str()).unwrap_or("Unknown");
             match status {
-                "True" => set_succeeded(customruns, name).await?,
+                "True" => {
+                    set_succeeded(customruns, customrun_name).await?;
+                    Ok(true)
+                }
                 "False" => {
                     let msg = c
                         .get("message")
                         .and_then(|m| m.as_str())
                         .unwrap_or("TaskRun failed");
-                    set_failed(customruns, name, msg).await?;
+                    set_failed(customruns, customrun_name, msg).await?;
+                    Ok(true)
                 }
                 _ => {
-                    set_running(customruns, name).await?;
+                    // "Unknown" — still running
+                    set_running(customruns, customrun_name).await?;
+                    Ok(false)
                 }
             }
         }
     }
-
-    Ok(())
 }
 
-async fn set_running(
-    customruns: &Api<DynamicObject>,
-    name: &str,
-) -> Result<(), CustomRunError> {
+// ── status patchers ───────────────────────────────────────────────────────────
+
+async fn set_running(customruns: &Api<DynamicObject>, name: &str) -> Result<(), CustomRunError> {
     patch_status(
-        customruns,
-        name,
+        customruns, name,
         CustomRunCondition {
             type_: "Succeeded".into(),
             status: "Unknown".into(),
@@ -348,17 +364,12 @@ async fn set_running(
             last_transition_time: Some(now()),
         },
         false,
-    )
-    .await
+    ).await
 }
 
-async fn set_succeeded(
-    customruns: &Api<DynamicObject>,
-    name: &str,
-) -> Result<(), CustomRunError> {
+async fn set_succeeded(customruns: &Api<DynamicObject>, name: &str) -> Result<(), CustomRunError> {
     patch_status(
-        customruns,
-        name,
+        customruns, name,
         CustomRunCondition {
             type_: "Succeeded".into(),
             status: "True".into(),
@@ -367,8 +378,7 @@ async fn set_succeeded(
             last_transition_time: Some(now()),
         },
         true,
-    )
-    .await
+    ).await
 }
 
 async fn set_failed(
@@ -377,8 +387,7 @@ async fn set_failed(
     message: &str,
 ) -> Result<(), CustomRunError> {
     patch_status(
-        customruns,
-        name,
+        customruns, name,
         CustomRunCondition {
             type_: "Succeeded".into(),
             status: "False".into(),
@@ -387,8 +396,7 @@ async fn set_failed(
             last_transition_time: Some(now()),
         },
         true,
-    )
-    .await
+    ).await
 }
 
 async fn patch_status(
@@ -409,6 +417,20 @@ async fn patch_status(
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+fn is_terminal(run: &DynamicObject) -> bool {
+    run.data
+        .get("status")
+        .and_then(|s| s.get("conditions"))
+        .and_then(|c| c.as_array())
+        .map(|conds| {
+            conds.iter().any(|c| {
+                c.get("type").and_then(|t| t.as_str()) == Some("Succeeded")
+                    && c.get("status").and_then(|s| s.as_str()) != Some("Unknown")
+            })
+        })
+        .unwrap_or(false)
+}
 
 fn customrun_api(client: &Client, ns: &str) -> Api<DynamicObject> {
     let ar = ApiResource {

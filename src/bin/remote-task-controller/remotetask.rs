@@ -87,6 +87,7 @@ pub async fn reconcile_remote_task(
         ns: &ns,
         owner_api_version: "gingersociety.org/v1alpha1",
         owner_kind: "RemoteTask",
+        owner_name: &name,
         owner_uid: owner_uid.as_str(),
         capability: &task.spec.capability,
         script: &task.spec.script,
@@ -94,6 +95,7 @@ pub async fn reconcile_remote_task(
         env,
         sidekick_url: &ctx.sidekick_url,
         auth_secret_name: &ctx.auth_secret_name,
+        extra_labels: std::collections::BTreeMap::new(),
     };
 
     create_taskrun(&ctx.client, taskrun_spec).await?;

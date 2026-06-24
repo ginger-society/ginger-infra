@@ -8,7 +8,7 @@
 use kube::{
     api::{Api, DynamicObject, PostParams},
     discovery::ApiResource,
-    Client, ResourceExt,
+    Client,
 };
 use serde_json::json;
 
@@ -28,6 +28,10 @@ pub struct TaskRunSpec<'a> {
     pub ns: &'a str,
     pub owner_api_version: &'a str,
     pub owner_kind: &'a str,
+    /// The name of the owning resource (may differ from `name` — e.g. for
+    /// CustomRun the TaskRun is named `<customrun>-exec` but the owner is the
+    /// CustomRun itself).
+    pub owner_name: &'a str,
     pub owner_uid: &'a str,
     pub capability: &'a str,
     pub script: &'a str,
@@ -37,6 +41,9 @@ pub struct TaskRunSpec<'a> {
     pub env: Vec<serde_json::Value>,
     pub sidekick_url: &'a str,
     pub auth_secret_name: &'a str,
+    /// Extra labels to merge onto the TaskRun metadata (e.g. the CustomRun
+    /// tracking label so we can find the TaskRun by label later).
+    pub extra_labels: std::collections::BTreeMap<String, String>,
 }
 
 /// Create a Tekton TaskRun that runs the runner image with the given spec.
@@ -57,6 +64,15 @@ pub async fn create_taskrun(client: &Client, spec: TaskRunSpec<'_>) -> Result<()
         step_env.push(json!({ "name": "REMOTE_CLEANUP", "value": cleanup }));
     }
 
+    // Merge base labels with any caller-supplied extras.
+    let mut labels = std::collections::BTreeMap::from([(
+        "app.kubernetes.io/managed-by".to_string(),
+        "remote-task-controller".to_string(),
+    )]);
+    for (k, v) in &spec.extra_labels {
+        labels.insert(k.clone(), v.clone());
+    }
+
     let taskrun = json!({
         "apiVersion": "tekton.dev/v1",
         "kind": "TaskRun",
@@ -66,14 +82,12 @@ pub async fn create_taskrun(client: &Client, spec: TaskRunSpec<'_>) -> Result<()
             "ownerReferences": [{
                 "apiVersion": spec.owner_api_version,
                 "kind": spec.owner_kind,
-                "name": spec.name,
+                "name": spec.owner_name,
                 "uid": spec.owner_uid,
                 "controller": true,
                 "blockOwnerDeletion": true,
             }],
-            "labels": {
-                "app.kubernetes.io/managed-by": "remote-task-controller",
-            }
+            "labels": labels,
         },
         "spec": {
             "taskSpec": {
@@ -111,10 +125,7 @@ pub async fn create_taskrun(client: &Client, spec: TaskRunSpec<'_>) -> Result<()
 
     match api.create(&PostParams::default(), &obj).await {
         Ok(_) => {
-            println!(
-                "[taskrun] created TaskRun {}/{}",
-                spec.ns, spec.name
-            );
+            println!("[taskrun] created TaskRun {}/{}", spec.ns, spec.name);
             Ok(())
         }
         Err(kube::Error::Api(ae)) if ae.code == 409 => {
