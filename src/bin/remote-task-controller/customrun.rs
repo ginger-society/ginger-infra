@@ -236,6 +236,24 @@ pub async fn reconcile_customrun(
             let mut extra_labels = std::collections::BTreeMap::new();
             extra_labels.insert(CUSTOMRUN_LABEL.to_string(), name.clone());
 
+            // Forward Tekton's pipeline labels from the CustomRun onto our
+            // TaskRun. The Tekton dashboard finds logs for a pipeline step by
+            // looking for a TaskRun with these labels — without them the log
+            // panel stays empty even when the step completes.
+            for key in &[
+                "tekton.dev/pipeline",
+                "tekton.dev/pipelineRun",
+                "tekton.dev/pipelineRunUID",
+                "tekton.dev/pipelineTask",
+                "tekton.dev/memberOf",
+            ] {
+                if let Some(val) = run.metadata.labels.as_ref()
+                    .and_then(|l| l.get(*key))
+                {
+                    extra_labels.insert(key.to_string(), val.clone());
+                }
+            }
+
             let taskrun_spec = TaskRunSpec {
                 name: &taskrun_name,
                 ns: &ns,
