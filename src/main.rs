@@ -86,6 +86,8 @@ enum Commands {
         /// Default sidekick URL to bake into the controller Deployment's env
         #[arg(long)]
         sidekick_url: Option<String>,
+        #[arg(long)]                 
+        runner_image: Option<String>,
     },
 }
 
@@ -111,10 +113,11 @@ async fn check_session_gurad(
 ) {
     
             match cli.command {
-                Commands::InstallTektonCrd { image, sidekick_url } => {
+                Commands::InstallTektonCrd { image, sidekick_url , runner_image} => {
                     if let Err(e) = install_tekton_crd::run_install_tekton_crd(
                         image.as_deref(),
                         sidekick_url.as_deref(),
+                        runner_image.as_deref(),
                     ) {
                         eprintln!("install-tekton-crd failed: {e}");
                         std::process::exit(1);

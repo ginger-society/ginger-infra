@@ -1,22 +1,33 @@
 #!/bin/sh
 # entrypoint.sh — runner image entry point
 #
-# Reads REMOTE_SCRIPT (and optionally REMOTE_CLEANUP) from the environment
-# (injected by the controller into the Tekton TaskRun step spec), writes them
-# to /tmp, then delegates to `ginger-infra rpc`.
+# 1. Copies auth.json from the Secret mounted at /var/run/ginger-society/
+#    to ~/.ginger-society/auth.json (where ginger-infra expects it).
+# 2. Writes REMOTE_SCRIPT / REMOTE_CLEANUP from env to /tmp.
+# 3. Delegates to: ginger-infra rpc --envrc /dev/null --script /tmp/script.sh …
 #
-# All user-declared env vars are already present in the environment because
-# Kubernetes injected them from the TaskRun step spec (literal values and
-# secretKeyRef entries alike). ginger-infra rpc passes them through to the
-# sidekick via the .envrc mechanism — here we write a minimal .envrc by
-# dumping the current environment so nothing is lost.
+# The Secret is mounted by the TaskRun spec generated in taskrun.rs.
+# Create it once in the cluster:
 #
-# Note: we use --envrc /dev/null because the env is already inherited;
-# the sidekick receives it via the RunJobRequest payload built in rpc.rs.
+#   kubectl create secret generic ginger-society-auth \
+#     --from-literal=auth.json='{"API_TOKEN":"<your-token>"}' \
+#     -n <namespace>
 
 set -e
 
-# ── write script ──────────────────────────────────────────────────────────────
+# ── auth ──────────────────────────────────────────────────────────────────────
+AUTH_SRC="/var/run/ginger-society/auth.json"
+AUTH_DST="$HOME/.ginger-society/auth.json"
+
+if [ -f "$AUTH_SRC" ]; then
+  mkdir -p "$(dirname "$AUTH_DST")"
+  cp "$AUTH_SRC" "$AUTH_DST"
+  echo "[runner] auth.json installed from mounted secret"
+else
+  echo "[runner] WARNING: $AUTH_SRC not found — ginger-infra may fail to authenticate" >&2
+fi
+
+# ── script ────────────────────────────────────────────────────────────────────
 if [ -z "$REMOTE_SCRIPT" ]; then
   echo "[runner] REMOTE_SCRIPT is not set — nothing to run" >&2
   exit 1
@@ -25,7 +36,7 @@ fi
 printf '%s\n' "$REMOTE_SCRIPT" > /tmp/script.sh
 chmod +x /tmp/script.sh
 
-# ── write cleanup script (optional) ──────────────────────────────────────────
+# ── cleanup (optional) ────────────────────────────────────────────────────────
 CLEANUP_ARG=""
 if [ -n "$REMOTE_CLEANUP" ]; then
   printf '%s\n' "$REMOTE_CLEANUP" > /tmp/cleanup.sh
@@ -33,11 +44,10 @@ if [ -n "$REMOTE_CLEANUP" ]; then
   CLEANUP_ARG="--cleanup /tmp/cleanup.sh"
 fi
 
-# ── capability (default: unix) ────────────────────────────────────────────────
+# ── run ───────────────────────────────────────────────────────────────────────
 CAPABILITY="${REMOTE_CAPABILITY:-unix}"
 
-# ── run ───────────────────────────────────────────────────────────────────────
-echo "[runner] executing capability=${CAPABILITY} script=/tmp/script.sh"
+echo "[runner] capability=${CAPABILITY}"
 
 exec ginger-infra rpc \
   --envrc /dev/null \

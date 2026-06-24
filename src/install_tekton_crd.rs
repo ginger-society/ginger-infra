@@ -8,12 +8,15 @@ use kube::CustomResourceExt;
 use crate::run_dry_run::{find_envrc_bounded, parse_envrc};
 
 const DEFAULT_CONTROLLER_IMAGE: &str = "gingersociety/remote-task-controller:latest";
+const DEFAULT_RUNNER_IMAGE: &str = "gingersociety/external-executor-runner:latest";
 const CONTROLLER_NAMESPACE: &str = "tekton-pipelines";
 const CONTROLLER_NAME: &str = "remote-task-controller";
+const AUTH_SECRET_NAME: &str = "ginger-society-auth";
 
 pub fn run_install_tekton_crd(
     image: Option<&str>,
     sidekick_url: Option<&str>,
+    runner_image: Option<&str>,
 ) -> anyhow::Result<()> {
     let sidekick_url = sidekick_url
         .ok_or_else(|| anyhow::anyhow!("--sidekick-url is required"))?;
@@ -28,16 +31,18 @@ pub fn run_install_tekton_crd(
 
     let controller_image = image.unwrap_or(DEFAULT_CONTROLLER_IMAGE);
     let deployment_yaml = render_deployment(controller_image, sidekick_url);
-    println!(
-        "  ✓ Controller Deployment generated (image: {})",
-        controller_image
-    );
+    println!("  ✓ Controller Deployment generated (image: {controller_image})");
+
+    let runner_img = runner_image.unwrap_or(DEFAULT_RUNNER_IMAGE);
+    let tekton_task_yaml = render_tekton_task(sidekick_url, runner_img);
+    println!("  ✓ Tekton Task 'remote-task' generated (runner: {runner_img})");
 
     let combined = format!(
-        "{}\n---\n{}\n---\n{}",
+        "{}\n---\n{}\n---\n{}\n---\n{}",
         crd_yaml.trim_end(),
         rbac_yaml.trim_end(),
-        deployment_yaml.trim_end()
+        deployment_yaml.trim_end(),
+        tekton_task_yaml.trim_end(),
     );
 
     let cwd = std::env::current_dir()?;
@@ -57,14 +62,15 @@ pub fn run_install_tekton_crd(
     println!("\n── Applying to cluster ──────────────────────────────");
     match kubectl_apply_stdin(&combined, &env_vars)? {
         true => {
-            println!("\n✓ RemoteTask CRD, RBAC, and controller installed.");
-            println!(
-                "  Verify with: kubectl get crd remotetasks.gingersociety.org"
-            );
-            println!(
-                "  Verify with: kubectl -n {} get deployment {}",
-                CONTROLLER_NAMESPACE, CONTROLLER_NAME
-            );
+            println!("\n✓ RemoteTask CRD, RBAC, controller, and Tekton Task installed.");
+            println!("  Verify CRD:        kubectl get crd remotetasks.gingersociety.org");
+            println!("  Verify controller: kubectl -n {CONTROLLER_NAMESPACE} get deployment {CONTROLLER_NAME}");
+            println!("  Verify Task:       kubectl -n {CONTROLLER_NAMESPACE} get task remote-task");
+            println!();
+            println!("  Create the auth secret (once per namespace):");
+            println!("    kubectl create secret generic {AUTH_SECRET_NAME} \\");
+            println!("      --from-literal=auth.json='{{\"API_TOKEN\":\"<your-token>\"}}' \\");
+            println!("      -n <your-namespace>");
             Ok(())
         }
         false => anyhow::bail!("kubectl apply failed — see output above"),
@@ -78,16 +84,6 @@ fn render_crd() -> anyhow::Result<String> {
 }
 
 fn render_rbac() -> String {
-    // The controller only needs permissions to:
-    //   - watch/patch RemoteTask (its own CRD)
-    //   - create/get TaskRuns (Tekton owns the rest)
-    //
-    // Removed vs old controller:
-    //   - secrets (no longer reads or creates them)
-    //   - configmaps (no longer creates them)
-    //   - events (Tekton emits its own)
-    //   - batch/jobs (no longer creates execution Jobs)
-    //   - tekton.dev/customruns (CustomRun bridging removed)
     format!(
         r#"apiVersion: v1
 kind: ServiceAccount
@@ -109,6 +105,12 @@ rules:
   - apiGroups: ["tekton.dev"]
     resources: ["taskruns"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["tekton.dev"]
+    resources: ["customruns"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["tekton.dev"]
+    resources: ["customruns/status"]
+    verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -161,9 +163,12 @@ spec:
           env:
             - name: SIDEKICK_URL
               value: "{sidekick_url}"
+            # AUTH_SECRET_NAME is the name of the Secret containing auth.json.
+            # Defaults to "ginger-society-auth" if unset.
+            # - name: AUTH_SECRET_NAME
+            #   value: "ginger-society-auth"
             # RUNNER_IMAGE controls which image the TaskRun steps run.
-            # Defaults to gingersociety/external-executor-runner:latest if
-            # unset — override here to pin a specific version.
+            # Defaults to gingersociety/external-executor-runner:latest if unset.
             # - name: RUNNER_IMAGE
             #   value: "gingersociety/external-executor-runner:latest"
 "#,
@@ -171,6 +176,55 @@ spec:
         ns = CONTROLLER_NAMESPACE,
         image = image,
         sidekick_url = sidekick_url,
+    )
+}
+
+/// A reusable Tekton Task for pipeline authors who prefer taskRef over the CRD.
+/// Installed alongside the controller so developers have both options.
+fn render_tekton_task(sidekick_url: &str, runner_image: &str) -> String {
+    format!(
+        r#"apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: remote-task
+  namespace: {ns}
+spec:
+  params:
+    - name: capability
+      type: string
+      default: "unix"
+    - name: script
+      type: string
+      description: "Shell script to run on the remote device"
+    - name: cleanup
+      type: string
+      default: ""
+      description: "Optional cleanup script to run after the main script"
+  steps:
+    - name: run
+      image: {runner_image}
+      env:
+        - name: REMOTE_CAPABILITY
+          value: $(params.capability)
+        - name: REMOTE_SCRIPT
+          value: $(params.script)
+        - name: REMOTE_CLEANUP
+          value: $(params.cleanup)
+        - name: EXTERNAL_EXECUTOR_URL
+          value: "{sidekick_url}"
+      volumeMounts:
+        - name: ginger-auth
+          mountPath: /var/run/ginger-society
+          readOnly: true
+  volumes:
+    - name: ginger-auth
+      secret:
+        secretName: {auth_secret}
+"#,
+        ns = CONTROLLER_NAMESPACE,
+        runner_image = runner_image,
+        sidekick_url = sidekick_url,
+        auth_secret = AUTH_SECRET_NAME,
     )
 }
 
@@ -212,10 +266,7 @@ fn kubectl_apply_stdin(
         }
         Ok(true)
     } else {
-        eprintln!(
-            "  ✗ kubectl apply failed (exit {:?})",
-            output.status.code()
-        );
+        eprintln!("  ✗ kubectl apply failed (exit {:?})", output.status.code());
         for line in stderr.lines() {
             eprintln!("    {}", line);
         }
