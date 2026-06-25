@@ -22,6 +22,7 @@ mod load_fixtures;
 mod verbose_replace;
 mod install_helm_charts;
 mod rpc;
+mod autoclean;
 
 mod install_tekton_crd;
 use ginger_infra::remote_task::RemoteTask;
@@ -170,8 +171,7 @@ async fn check_session_gurad(
                         .await
                 }
                 Commands::Deploy => todo!(),
-                Commands::Start {device_id, capabilities}=> {
-
+                Commands::Start { device_id, capabilities } => {
                     let capabilities: Vec<String> = capabilities
                         .as_deref()
                         .map(|csv| {
@@ -183,9 +183,15 @@ async fn check_session_gurad(
                         .filter(|v| !v.is_empty())
                         .unwrap_or_else(|| vec!["unix".to_string()]);
 
+                    // Start autoclean scheduler if capability is present
+                    if capabilities.iter().any(|c| c == "autoclean-docker") {
+                        tokio::spawn(async {
+                            autoclean::start_autoclean_scheduler().await;
+                        });
+                    }
+
                     match identity_validate_api_token(&iam_config).await {
                         Ok(response) => {
-
                             start::main(token.clone(), response, &metadata_config, device_id, capabilities).await;
                         }
                         Err(error) => {
@@ -193,7 +199,6 @@ async fn check_session_gurad(
                             std::process::exit(1);
                         }
                     }
-                
                 }
                 Commands::InstallHelmCharts => {
                     if let Err(e) = install_helm_charts::run_install_helm_charts() {
