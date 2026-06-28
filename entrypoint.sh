@@ -1,6 +1,14 @@
 #!/bin/sh
 set -e
 
+# ── HOME ──────────────────────────────────────────────────────────────────────
+# The runner image may not have a writable home directory for its container
+# user (e.g. /home/runner doesn't exist or is read-only). Force HOME to /tmp
+# so every tool that writes to ~/ (ginger-infra, ssh, docker, npm, pip) works
+# without any filesystem permission issues. Must be set before anything below
+# uses $HOME.
+export HOME=/tmp
+
 # ── auth ──────────────────────────────────────────────────────────────────────
 # GINGER_AUTH_PATH is set by the controller to point at the auth.json that
 # init-credentials wrote to the shared creds workspace:
