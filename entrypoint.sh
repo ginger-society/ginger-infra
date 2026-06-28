@@ -33,19 +33,32 @@ fi
 # init-credentials writes the SSH certificate + key pair to
 # /workspace/creds/ssh/. Copy them into ~/.ssh/ so ginger-infra can use the
 # signed certificate when connecting to remote executors.
+#
+# NOTE: init-credentials runs as a different container user and may have
+# written the private key with mode 600 (owner-only). If we can't read a file
+# we skip it with a warning rather than aborting — auth.json is sufficient for
+# ginger-infra token auth; the SSH cert is only needed for SSH-mode transports.
+# The permanent fix is to set mode 644 on the public files and 640 with a
+# shared group on the private key inside copy-credentials-to-workspace.sh.
 SSH_SRC="$CREDS_ROOT/ssh"
 if [ -d "$SSH_SRC" ]; then
   mkdir -p "$HOME/.ssh"
   chmod 700 "$HOME/.ssh"
   for f in id_ed25519 id_ed25519.pub id_ed25519-cert.pub; do
-    if [ -f "$SSH_SRC/$f" ]; then
-      cp "$SSH_SRC/$f" "$HOME/.ssh/$f"
-      # Private key must be 600 or ssh-agent/ginger-infra will refuse it.
-      case "$f" in
-        id_ed25519) chmod 600 "$HOME/.ssh/$f" ;;
-        *)          chmod 644 "$HOME/.ssh/$f" ;;
-      esac
+    src="$SSH_SRC/$f"
+    dst="$HOME/.ssh/$f"
+    if [ ! -f "$src" ]; then
+      continue
     fi
+    if [ ! -r "$src" ]; then
+      echo "[runner] WARNING: $src is not readable (permission denied) — skipping" >&2
+      continue
+    fi
+    cp "$src" "$dst"
+    case "$f" in
+      id_ed25519) chmod 600 "$dst" ;;
+      *)          chmod 644 "$dst" ;;
+    esac
   done
   echo "[runner] SSH keys installed from $SSH_SRC"
 else
