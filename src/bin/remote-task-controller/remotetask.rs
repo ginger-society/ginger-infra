@@ -8,6 +8,14 @@
 //!   kubectl apply -f my-task.yaml
 //!
 //! For the pipeline path (taskRef: kind: RemoteTask) see customrun.rs.
+//!
+//! ## Credentials
+//!
+//! Standalone RemoteTasks are not part of a pipeline and therefore have no
+//! shared workspace written by init-credentials. The runner image is expected
+//! to find auth.json at its default location (~/.ginger-society/auth.json) on
+//! the node — useful for dev/test scenarios. Pass `creds_workspace_claim: None`
+//! to taskrun.rs to skip the workspace volume entirely.
 
 use std::sync::Arc;
 
@@ -30,7 +38,6 @@ const REQUEUE_AFTER_ERROR_SECS: u64 = 30;
 pub struct RemoteTaskContext {
     pub client: Client,
     pub sidekick_url: String,
-    pub auth_secret_name: String,
 }
 
 // ── errors ────────────────────────────────────────────────────────────────────
@@ -94,8 +101,10 @@ pub async fn reconcile_remote_task(
         cleanup: task.spec.cleanup.as_deref(),
         env,
         sidekick_url: &ctx.sidekick_url,
-        auth_secret_name: &ctx.auth_secret_name,
         extra_labels: std::collections::BTreeMap::new(),
+        // Standalone RemoteTasks have no pipeline workspace — the runner
+        // will use whatever credentials already exist on the node.
+        creds_workspace_claim: None,
     };
 
     create_taskrun(&ctx.client, taskrun_spec).await?;

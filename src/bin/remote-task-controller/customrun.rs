@@ -19,6 +19,16 @@
 //! The label key has NO slash — slashes in label keys are valid in Kubernetes
 //! but the kube-rs ListParams label selector does not escape them, causing the
 //! API server to reject the selector with a 400. Use a plain key instead.
+//!
+//! ## Credentials / workspace
+//!
+//! Previously the runner mounted a Kubernetes Secret containing auth.json.
+//! That is replaced by the shared `creds` workspace written by the
+//! init-credentials step injected by ginger-gitter. Tekton propagates the
+//! PipelineRun's workspace bindings onto each CustomRun via
+//! `spec.workspaces[]`, so we read the PVC claim name from there and pass it
+//! to the TaskRun builder. The runner reads
+//! /workspace/creds/ginger-society/auth.json directly.
 
 use std::sync::Arc;
 
@@ -46,6 +56,11 @@ const OUR_KIND: &str = "RemoteTask";
 // No slash in the label key — avoids kube-rs label selector escaping issues.
 const CUSTOMRUN_LABEL: &str = "remotetask-customrun";
 
+/// The workspace name that ginger-gitter injects and init-credentials writes
+/// to. Must match the name declared in the Pipeline's `workspaces:` list and
+/// the name used in taskrun.rs.
+const CREDS_WORKSPACE_NAME: &str = "creds";
+
 const REQUEUE_AFTER_ERROR_SECS: u64 = 15;
 const REQUEUE_WHILE_RUNNING_SECS: u64 = 5;
 
@@ -54,7 +69,6 @@ const REQUEUE_WHILE_RUNNING_SECS: u64 = 5;
 pub struct CustomRunContext {
     pub client: Client,
     pub sidekick_url: String,
-    pub auth_secret_name: String,
 }
 
 // ── errors ────────────────────────────────────────────────────────────────────
@@ -81,6 +95,10 @@ struct CustomRunSpec {
     custom_ref: Option<CustomRef>,
     #[serde(default)]
     params: Vec<Param>,
+    /// Workspace bindings propagated from the PipelineRun by Tekton.
+    /// We look for the "creds" workspace here to get the PVC claim name.
+    #[serde(default)]
+    workspaces: Vec<WorkspaceBinding>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +128,22 @@ impl ParamValue {
             ParamValue::Array(_) => None,
         }
     }
+}
+
+/// A single workspace binding as Tekton copies it onto the CustomRun.
+/// We only need `name` and the PVC claim name; other binding types
+/// (emptyDir, configMap, secret) are not relevant for the creds workspace.
+#[derive(Debug, Deserialize)]
+struct WorkspaceBinding {
+    name: String,
+    #[serde(rename = "persistentVolumeClaim")]
+    persistent_volume_claim: Option<PvcRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PvcRef {
+    #[serde(rename = "claimName")]
+    claim_name: String,
 }
 
 // ── status types ──────────────────────────────────────────────────────────────
@@ -165,6 +199,17 @@ fn parse_params(params: &[Param]) -> Result<ParsedSpec, CustomRunError> {
     })
 }
 
+/// Extract the PVC claim name for the `creds` workspace from the CustomRun's
+/// workspace bindings. Returns `None` if no creds workspace was bound (e.g.
+/// the pipeline didn't declare one, or this is a test/dev run).
+fn extract_creds_claim(workspaces: &[WorkspaceBinding]) -> Option<String> {
+    workspaces
+        .iter()
+        .find(|w| w.name == CREDS_WORKSPACE_NAME)
+        .and_then(|w| w.persistent_volume_claim.as_ref())
+        .map(|pvc| pvc.claim_name.clone())
+}
+
 // ── reconciler ────────────────────────────────────────────────────────────────
 
 pub async fn reconcile_customrun(
@@ -207,6 +252,17 @@ pub async fn reconcile_customrun(
 
     // Look up OUR TaskRun by label (no slash in key = no selector escaping).
     let our_taskrun = find_our_taskrun(&ctx.client, &ns, &name).await?;
+
+    // Resolve the creds workspace PVC claim from the CustomRun's workspace
+    // bindings (propagated there by Tekton from the PipelineRun).
+    let creds_workspace_claim = extract_creds_claim(&spec.workspaces);
+    if creds_workspace_claim.is_none() {
+        eprintln!(
+            "[customrun] '{name}' has no '{}' workspace binding — \
+             runner will not have access to credentials written by init-credentials",
+            CREDS_WORKSPACE_NAME
+        );
+    }
 
     match our_taskrun {
         Some(taskrun) => {
@@ -266,8 +322,8 @@ pub async fn reconcile_customrun(
                 cleanup: parsed.cleanup.as_deref(),
                 env: parsed.env,
                 sidekick_url: &ctx.sidekick_url,
-                auth_secret_name: &ctx.auth_secret_name,
                 extra_labels,
+                creds_workspace_claim,
             };
 
             if let Err(e) = create_taskrun(&ctx.client, taskrun_spec).await {

@@ -25,14 +25,9 @@ mod rpc;
 mod autoclean;
 
 mod install_tekton_crd;
-use ginger_infra::remote_task::RemoteTask;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Initialize a infra project
-    Init,
-    /// generate/update resources for all the databases in the workspace
-    SyncDBServices,
     // after taking a snapshot using ginger-releaser , we can apply it using this - this might be a stop action , but can be called immediately after the releaser command
     Plan,
     /// Run a dry-run of the plan command
@@ -126,13 +121,6 @@ async fn check_session_gurad(
                 },
                 Commands::Rpc { envrc, script, cleanup, capability } => {
                     rpc::run_rpc(&envrc, &script, cleanup.as_deref(), &capability).await;
-                }
-                Commands::Init => {
-                    println!("Hello, world!");
-                }
-                Commands::SyncDBServices => {
-                    // generate/update resources for all the databases in the workspace
-                    println!("Hello, world!");
                 }
                 Commands::Plan => {
                    if let Err(e) = plan::run_plan() {

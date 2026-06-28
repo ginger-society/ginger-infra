@@ -12,6 +12,14 @@
 //!
 //! In both cases the controller's only job is: parse spec → create TaskRun.
 //! Tekton owns pod lifecycle, logs, dashboard, and pipeline view from there.
+//!
+//! ## Credentials
+//!
+//! The runner no longer needs a Kubernetes Secret for auth.json. Credentials
+//! are written to the shared `creds` workspace by the init-credentials step
+//! injected by ginger-gitter, and the runner reads them from there via the
+//! GINGER_AUTH_PATH env var set by taskrun.rs. The AUTH_SECRET_NAME env var
+//! has been removed.
 
 use std::sync::Arc;
 
@@ -42,11 +50,7 @@ async fn main() -> anyhow::Result<()> {
     let sidekick_url = std::env::var("SIDEKICK_URL")
         .map_err(|_| anyhow::anyhow!("SIDEKICK_URL env var is required"))?;
 
-    let auth_secret_name = std::env::var("AUTH_SECRET_NAME")
-        .unwrap_or_else(|_| "ginger-society-auth".to_string());
-
     println!("[remote-task-controller] sidekick_url={sidekick_url}");
-    println!("[remote-task-controller] auth_secret_name={auth_secret_name}");
 
     let client = Client::try_default().await?;
 
@@ -64,7 +68,6 @@ async fn main() -> anyhow::Result<()> {
     let customrun_ctx = Arc::new(CustomRunContext {
         client: client.clone(),
         sidekick_url: sidekick_url.clone(),
-        auth_secret_name: auth_secret_name.clone(),
     });
 
     let customrun_controller = Controller::new_with(
@@ -84,7 +87,6 @@ async fn main() -> anyhow::Result<()> {
     let remotetask_ctx = Arc::new(RemoteTaskContext {
         client: client.clone(),
         sidekick_url,
-        auth_secret_name,
     });
 
     let remotetask_controller = Controller::new(
