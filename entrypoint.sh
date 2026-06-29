@@ -70,15 +70,16 @@ if [ -n "$REMOTE_CLEANUP" ]; then
 fi
 
 # ── envrc ─────────────────────────────────────────────────────────────────────
-# CRED_* vars flow through here to the device. Controller-only vars that must
-# NOT reach the device:
 SKIP_VARS="REMOTE_SCRIPT REMOTE_CAPABILITY REMOTE_CLEANUP EXTERNAL_EXECUTOR_URL GINGER_AUTH_PATH HOME PATH PWD HOSTNAME done"
+
+ENVRC=/tmp/.envrc
+: > "$ENVRC"
 
 env | while IFS='=' read -r key value; do
   case "$key" in
     *[!A-Za-z0-9_]*|'') continue ;;
-    KUBERNETES_*) continue ;;        # ← skip all KUBERNETES_* 
-    TEKTON_*) continue ;;            # ← skip all TEKTON_*
+    KUBERNETES_*) continue ;;
+    TEKTON_*) continue ;;
   esac
   skip=0
   for s in $SKIP_VARS; do
@@ -89,9 +90,7 @@ env | while IFS='=' read -r key value; do
   printf "export %s='%s'\n" "$key" "$escaped" >> "$ENVRC"
 done
 
-
-ENVRC=/tmp/.envrc
-: > "$ENVRC"
+echo "[runner] envrc written: $(wc -l < "$ENVRC") var(s)"
 
 env | while IFS='=' read -r key value; do
   case "$key" in
