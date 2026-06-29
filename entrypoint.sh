@@ -92,21 +92,6 @@ done
 
 echo "[runner] envrc written: $(wc -l < "$ENVRC") var(s)"
 
-env | while IFS='=' read -r key value; do
-  case "$key" in
-    *[!A-Za-z0-9_]*|'') continue ;;
-  esac
-  skip=0
-  for s in $SKIP_VARS; do
-    [ "$key" = "$s" ] && skip=1 && break
-  done
-  [ "$skip" = "1" ] && continue
-  escaped=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
-  printf "export %s='%s'\n" "$key" "$escaped" >> "$ENVRC"
-done
-
-echo "[runner] envrc written: $(wc -l < "$ENVRC") var(s)"
-
 # ── run ───────────────────────────────────────────────────────────────────────
 CAPABILITY="${REMOTE_CAPABILITY:-unix}"
 echo "[runner] capability=${CAPABILITY} executor=${EXTERNAL_EXECUTOR_URL}"

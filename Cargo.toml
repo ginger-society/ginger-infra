@@ -9,10 +9,6 @@ default-run = "ginger-infra"
 name = "remote-task-controller"
 path = "src/bin/remote-task-controller/main.rs"
 
-[[bin]]
-name="quarantined-shell-executor"
-path = "src/bin/quarantined-shell-executor/main.rs"
-
 [package.metadata]
 organization = "ginger-society"
 
