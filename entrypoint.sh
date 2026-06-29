@@ -4,26 +4,35 @@ set -e
 # ── HOME ──────────────────────────────────────────────────────────────────────
 export HOME=/tmp
 
-# ── ARCHITECTURE NOTE ─────────────────────────────────────────────────────────
+# ── Install auth.json for ginger-infra rpc (local use in this pod) ───────────
 #
-#   runner pod  →  ginger-infra rpc  →  sidekick  →  WAMP "execute"  →  device
-#
-# Credential files in /workspace/creds exist ONLY in the cluster pod.
-# The device receives only env vars (via ExecuteArgs.env).
-#
-# Strategy: base64-encode every credential file and inject it as a CRED_*
-# env var. Also inject RPC_JOB_ID (the WAMP job_id) so the device script
-# can reconstruct the files at a unique, collision-safe path:
-#   /tmp/rpc/<RPC_JOB_ID>/{ginger-society/auth.json, .ssh/, .docker/, ...}
-#
-# The device script calls the helper at the top:
-#   eval "$(reconstruct_rpc_creds)"   # or source a helper written by this runner
-
+# ginger-infra rpc reads $HOME/.ginger-society/auth.json to authenticate its
+# POST to the external-executor API. This is separate from the credentials we
+# forward to the device — this is just for the rpc binary itself running here
+# in the runner pod.
 GINGER_AUTH_PATH="${GINGER_AUTH_PATH:-/var/run/ginger-society/auth.json}"
+
+if [ -f "$GINGER_AUTH_PATH" ]; then
+  mkdir -p "$HOME/.ginger-society"
+  cp "$GINGER_AUTH_PATH" "$HOME/.ginger-society/auth.json"
+  echo "[runner] auth.json installed for ginger-infra rpc (from $GINGER_AUTH_PATH)"
+else
+  echo "[runner] WARNING: $GINGER_AUTH_PATH not found — ginger-infra rpc will fail to authenticate" >&2
+  exit 1
+fi
+
+# ── Encode credentials for forwarding to the device ──────────────────────────
+#
+# ARCHITECTURE:
+#   runner pod  →  ginger-infra rpc  →  sidekick  →  WAMP execute  →  device
+#
+# Credential files exist only in this pod. We base64-encode each one into a
+# CRED_* env var so it flows through the envrc → RunJobRequest.env →
+# ExecuteArgs.env → device bash subprocess, where the device script reconstructs
+# them by sourcing ~/.ginger-society/hooks/rpc_creds.sh
+
 CREDS_ROOT="$(dirname "$(dirname "$GINGER_AUTH_PATH")")"  # /workspace/creds
 
-# ── encode one credential file into an env var ────────────────────────────────
-# Usage: encode_cred VAR_NAME /path/to/file
 encode_cred() {
   var_name="$1"
   file_path="$2"
@@ -36,13 +45,13 @@ encode_cred() {
   fi
 }
 
-encode_cred CRED_AUTH_JSON       "$CREDS_ROOT/ginger-society/auth.json"
-encode_cred CRED_SSH_KEY         "$CREDS_ROOT/ssh/id_ed25519"
-encode_cred CRED_SSH_KEY_PUB     "$CREDS_ROOT/ssh/id_ed25519.pub"
-encode_cred CRED_SSH_CERT        "$CREDS_ROOT/ssh/id_ed25519-cert.pub"
-encode_cred CRED_DOCKER_CONFIG   "$CREDS_ROOT/docker/config.json"
-encode_cred CRED_NPMRC           "$CREDS_ROOT/.npmrc"
-encode_cred CRED_PYPIRC          "$CREDS_ROOT/.pypirc"
+encode_cred CRED_AUTH_JSON     "$CREDS_ROOT/ginger-society/auth.json"
+encode_cred CRED_SSH_KEY       "$CREDS_ROOT/ssh/id_ed25519"
+encode_cred CRED_SSH_KEY_PUB   "$CREDS_ROOT/ssh/id_ed25519.pub"
+encode_cred CRED_SSH_CERT      "$CREDS_ROOT/ssh/id_ed25519-cert.pub"
+encode_cred CRED_DOCKER_CONFIG "$CREDS_ROOT/docker/config.json"
+encode_cred CRED_NPMRC         "$CREDS_ROOT/.npmrc"
+encode_cred CRED_PYPIRC        "$CREDS_ROOT/.pypirc"
 
 # ── script ────────────────────────────────────────────────────────────────────
 if [ -z "$REMOTE_SCRIPT" ]; then
@@ -61,8 +70,8 @@ if [ -n "$REMOTE_CLEANUP" ]; then
 fi
 
 # ── envrc ─────────────────────────────────────────────────────────────────────
-# CRED_* vars and RPC_JOB_ID will be picked up here automatically since they
-# are now in the environment. Controller-only vars that must NOT reach the device:
+# CRED_* vars flow through here to the device. Controller-only vars that must
+# NOT reach the device:
 SKIP_VARS="REMOTE_SCRIPT REMOTE_CAPABILITY REMOTE_CLEANUP EXTERNAL_EXECUTOR_URL GINGER_AUTH_PATH HOME PATH"
 
 ENVRC=/tmp/.envrc
