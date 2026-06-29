@@ -147,6 +147,9 @@ pub async fn main(
                     cmd.env(k, v);
                 }
 
+                cmd.env("RPC_JOB_ID", &parsed.job_id);           // ← NEW
+                cmd.env("RPC_CREDS_DIR", format!("/tmp/rpc/{}", &parsed.job_id)); // ← NEW
+
                 let mut child = cmd.spawn().map_err(|e| {
                     json!({"error": format!("failed to spawn run.sh: {}", e)})
                 })?;
@@ -236,6 +239,9 @@ pub async fn main(
                         cleanup_cmd.env(k, v);
                     }
 
+                    cleanup_cmd.env("RPC_JOB_ID", &parsed.job_id);          
+                    cleanup_cmd.env("RPC_CREDS_DIR", format!("/tmp/rpc/{}", &parsed.job_id));
+
                     match cleanup_cmd.spawn() {
                         Err(e) => {
                             eprintln!("[execute] failed to spawn cleanup.sh: {}", e);
@@ -273,6 +279,8 @@ pub async fn main(
 
                 // ── 5. clean up job dir ───────────────────────────────────────
                 let _ = tokio::fs::remove_dir_all(&job_dir).await;
+
+                let _ = tokio::fs::remove_dir_all(format!("/tmp/rpc/{}", &parsed.job_id)).await;
 
                 // ── 6. publish terminal event to close the SSE stream ─────────
                 //
