@@ -16,6 +16,7 @@ organization = "ginger-society"
 IAMService = {path = "./IAMService_client"}
 MetadataService = {path = "./MetadataService_client"}
 GingerPresence = { path = "./GingerPresence_client" }
+GingerBucket = { path = "./GingerBucket_client" }
 clap = {version = "4.5.7", features = ["derive"]}
 colored = {version = "2.0.1"}
 ginger-shared-rs = {version = "0.50.0-nightly.0", organization = "ginger-society"}
@@ -40,4 +41,5 @@ serde_yaml = "0.9"
 thiserror = "1"
 tokio-cron-scheduler = "0.10"
 chrono = "0.4"
+indicatif = "0.17"
 

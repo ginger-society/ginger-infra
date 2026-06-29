@@ -2,6 +2,7 @@
 IAMService_client
 MetadataService_client
 GingerPresence_client
+GingerBucket_client
 .ginger.tmp
 .DS_Store
 bin/**/ginger-infra
