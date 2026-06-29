@@ -79,9 +79,9 @@ enum Commands {
         /// Controller image to deploy (default: gingersociety/remote-task-controller:latest)
         #[arg(long)]
         image: Option<String>,
-        /// Default sidekick URL to bake into the controller Deployment's env
+        /// Default executor URL to bake into the controller Deployment's env
         #[arg(long)]
-        sidekick_url: Option<String>,
+        executor_url: Option<String>,
         #[arg(long)]                 
         runner_image: Option<String>,
     },
@@ -109,10 +109,10 @@ async fn check_session_gurad(
 ) {
     
             match cli.command {
-                Commands::InstallTektonCrd { image, sidekick_url , runner_image} => {
+                Commands::InstallTektonCrd { image, executor_url , runner_image} => {
                     if let Err(e) = install_tekton_crd::run_install_tekton_crd(
                         image.as_deref(),
-                        sidekick_url.as_deref(),
+                        executor_url.as_deref(),
                         runner_image.as_deref(),
                     ) {
                         eprintln!("install-tekton-crd failed: {e}");

@@ -53,7 +53,7 @@ pub struct TaskRunSpec<'a> {
     /// Pre-built serde_json env entries, each `{"name": "...", "value": "..."}`
     /// or `{"name": "...", "valueFrom": {...}}`.
     pub env: Vec<serde_json::Value>,
-    pub sidekick_url: &'a str,
+    pub executor_url: &'a str,
     /// Extra labels to merge onto the TaskRun metadata (e.g. the CustomRun
     /// tracking label so we can find the TaskRun by label later).
     pub extra_labels: std::collections::BTreeMap<String, String>,
@@ -77,7 +77,7 @@ pub async fn create_taskrun(client: &Client, spec: TaskRunSpec<'_>) -> Result<()
     step_env.extend([
         json!({ "name": "REMOTE_SCRIPT",         "value": spec.script }),
         json!({ "name": "REMOTE_CAPABILITY",     "value": spec.capability }),
-        json!({ "name": "EXTERNAL_EXECUTOR_URL", "value": spec.sidekick_url }),
+        json!({ "name": "EXTERNAL_EXECUTOR_URL", "value": spec.executor_url }),
         // Tell the runner where to find auth.json. The runner's entrypoint.sh
         // reads this path instead of the old /var/run/ginger-society location.
         json!({ "name": "GINGER_AUTH_PATH", "value": format!("{CREDS_MOUNT_PATH}/ginger-society/auth.json") }),

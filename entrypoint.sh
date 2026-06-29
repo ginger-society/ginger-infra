@@ -24,7 +24,7 @@ fi
 # ── Encode credentials for forwarding to the device ──────────────────────────
 #
 # ARCHITECTURE:
-#   runner pod  →  ginger-infra rpc  →  sidekick  →  WAMP execute  →  device
+#   runner pod  →  ginger-infra rpc  →  executor  →  WAMP execute  →  device
 #
 # Credential files exist only in this pod. We base64-encode each one into a
 # CRED_* env var so it flows through the envrc → RunJobRequest.env →

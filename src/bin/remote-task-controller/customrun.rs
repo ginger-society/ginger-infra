@@ -68,7 +68,7 @@ const REQUEUE_WHILE_RUNNING_SECS: u64 = 5;
 
 pub struct CustomRunContext {
     pub client: Client,
-    pub sidekick_url: String,
+    pub executor_url: String,
 }
 
 // ── errors ────────────────────────────────────────────────────────────────────
@@ -321,7 +321,7 @@ pub async fn reconcile_customrun(
                 script: &parsed.script,
                 cleanup: parsed.cleanup.as_deref(),
                 env: parsed.env,
-                sidekick_url: &ctx.sidekick_url,
+                executor_url: &ctx.executor_url,
                 extra_labels,
                 creds_workspace_claim,
             };

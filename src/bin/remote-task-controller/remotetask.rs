@@ -37,7 +37,7 @@ const REQUEUE_AFTER_ERROR_SECS: u64 = 30;
 
 pub struct RemoteTaskContext {
     pub client: Client,
-    pub sidekick_url: String,
+    pub executor_url: String,
 }
 
 // ── errors ────────────────────────────────────────────────────────────────────
@@ -100,7 +100,7 @@ pub async fn reconcile_remote_task(
         script: &task.spec.script,
         cleanup: task.spec.cleanup.as_deref(),
         env,
-        sidekick_url: &ctx.sidekick_url,
+        executor_url: &ctx.executor_url,
         extra_labels: std::collections::BTreeMap::new(),
         // Standalone RemoteTasks have no pipeline workspace — the runner
         // will use whatever credentials already exist on the node.

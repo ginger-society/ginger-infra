@@ -47,10 +47,10 @@ use remotetask::{error_policy, reconcile_remote_task, RemoteTaskContext};
 async fn main() -> anyhow::Result<()> {
     println!("[remote-task-controller] starting...");
 
-    let sidekick_url = std::env::var("SIDEKICK_URL")
-        .map_err(|_| anyhow::anyhow!("SIDEKICK_URL env var is required"))?;
+    let executor_url = std::env::var("EXECUTOR_URL")
+        .map_err(|_| anyhow::anyhow!("EXECUTOR_URL env var is required"))?;
 
-    println!("[remote-task-controller] sidekick_url={sidekick_url}");
+    println!("[remote-task-controller] executor_url={executor_url}");
 
     let client = Client::try_default().await?;
 
@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
 
     let customrun_ctx = Arc::new(CustomRunContext {
         client: client.clone(),
-        sidekick_url: sidekick_url.clone(),
+        executor_url: executor_url.clone(),
     });
 
     let customrun_controller = Controller::new_with(
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     // ── RemoteTask controller ──────────────────────────────────────────────
     let remotetask_ctx = Arc::new(RemoteTaskContext {
         client: client.clone(),
-        sidekick_url,
+        executor_url,
     });
 
     let remotetask_controller = Controller::new(

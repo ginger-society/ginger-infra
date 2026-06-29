@@ -61,10 +61,10 @@ struct ExecuteArgs {
     job_id: String,
     script: String,
     cleanup_script: Option<String>,
-    /// Flat key/value env vars — already resolved by the sidekick
+    /// Flat key/value env vars — already resolved by the executor
     #[serde(default)]
     env: std::collections::HashMap<String, String>,
-    /// WAMP channel of the sidekick to publish log events back to
+    /// WAMP channel of the executor to publish log events back to
     reply_channel: String,
 }
 
@@ -85,7 +85,7 @@ pub async fn main(
 
     // ── execute ───────────────────────────────────────────────────────────────
     //
-    // Called by the sidekick service to run a shell script on this device.
+    // Called by the executor service to run a shell script on this device.
     //
     // Flow:
     //   1. Write script to /tmp/{job_id}/run.sh and chmod +x
@@ -93,9 +93,9 @@ pub async fn main(
     //      WAMP publish events with type="log"
     //   3. Wait for exit
     //   4. Run cleanup_script (if any) unconditionally — failures logged, not propagated
-    //   5. Publish a type="done" or type="error" event so the sidekick closes the SSE stream
+    //   5. Publish a type="done" or type="error" event so the executor closes the SSE stream
     //   6. Return Ok({exit_code}) or Err({exit_code, error}) — this unblocks the
-    //      sidekick's call() which then triggers its own cleanup path
+    //      executor's call() which then triggers its own cleanup path
     {
         let execute_client = Arc::clone(&client);
         client.register("execute", move |_args, kwargs| {
@@ -147,8 +147,8 @@ pub async fn main(
                     cmd.env(k, v);
                 }
 
-                cmd.env("RPC_JOB_ID", &parsed.job_id);           // ← NEW
-                cmd.env("RPC_CREDS_DIR", format!("/tmp/rpc/{}", &parsed.job_id)); // ← NEW
+                cmd.env("RPC_JOB_ID", &parsed.job_id);           
+                cmd.env("RPC_CREDS_DIR", format!("/tmp/rpc/{}", &parsed.job_id));
 
                 let mut child = cmd.spawn().map_err(|e| {
                     json!({"error": format!("failed to spawn run.sh: {}", e)})
@@ -159,7 +159,7 @@ pub async fn main(
                 // Each line is published to reply_channel with kwargs:
                 //   { type: "log", stream: "stdout"|"stderr", line: "...", correlation_id: "..." }
                 //
-                // The sidekick's event_subs listener picks these up and
+                // The executor's event_subs listener picks these up and
                 // forwards them to the caller's SSE stream.
 
                 let stdout = child.stdout.take();
@@ -280,11 +280,11 @@ pub async fn main(
                 // ── 5. clean up job dir ───────────────────────────────────────
                 let _ = tokio::fs::remove_dir_all(&job_dir).await;
 
-                let _ = tokio::fs::remove_dir_all(format!("/tmp/rpc/{}", &parsed.job_id)).await;
+                let _ = tokio::fs::remove_dir_all( format!("/tmp/rpc/{}", &parsed.job_id) ).await;  
 
                 // ── 6. publish terminal event to close the SSE stream ─────────
                 //
-                // This must happen BEFORE returning so the sidekick's
+                // This must happen BEFORE returning so the executor's
                 // event subscriber receives "done"/"error" and yields the
                 // final SSE event before the call() resolves.
                 if status.success() {

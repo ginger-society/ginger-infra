@@ -2,7 +2,7 @@
 #
 # Builds the remote-task-controller binary.
 # The controller's only job is: watch RemoteTask → create TaskRun.
-# It does no HTTP work and holds no sidekick connection.
+# It does no HTTP work and holds no executor connection.
 
 # ── Stage 1: build ────────────────────────────────────────────────────────────
 FROM gingersociety/rust-rocket-api-builder:latest AS builder

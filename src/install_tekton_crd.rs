@@ -15,11 +15,11 @@ const AUTH_SECRET_NAME: &str = "ginger-society-auth";
 
 pub fn run_install_tekton_crd(
     image: Option<&str>,
-    sidekick_url: Option<&str>,
+    executor_url: Option<&str>,
     runner_image: Option<&str>,
 ) -> anyhow::Result<()> {
-    let sidekick_url = sidekick_url
-        .ok_or_else(|| anyhow::anyhow!("--sidekick-url is required"))?;
+    let executor_url = executor_url
+        .ok_or_else(|| anyhow::anyhow!("--executor-url is required"))?;
 
     println!("── Generating RemoteTask CRD + controller manifests ─");
 
@@ -30,11 +30,11 @@ pub fn run_install_tekton_crd(
     println!("  ✓ RBAC manifests generated");
 
     let controller_image = image.unwrap_or(DEFAULT_CONTROLLER_IMAGE);
-    let deployment_yaml = render_deployment(controller_image, sidekick_url);
+    let deployment_yaml = render_deployment(controller_image, executor_url);
     println!("  ✓ Controller Deployment generated (image: {controller_image})");
 
     let runner_img = runner_image.unwrap_or(DEFAULT_RUNNER_IMAGE);
-    let tekton_task_yaml = render_tekton_task(sidekick_url, runner_img);
+    let tekton_task_yaml = render_tekton_task(executor_url, runner_img);
     println!("  ✓ Tekton Task 'remote-task' generated (runner: {runner_img})");
 
     let combined = format!(
@@ -130,7 +130,7 @@ subjects:
     )
 }
 
-fn render_deployment(image: &str, sidekick_url: &str) -> String {
+fn render_deployment(image: &str, executor_url: &str) -> String {
     format!(
         r#"apiVersion: apps/v1
 kind: Deployment
@@ -161,8 +161,8 @@ spec:
             capabilities:
               drop: ["ALL"]
           env:
-            - name: SIDEKICK_URL
-              value: "{sidekick_url}"
+            - name: EXECUTOR_URL
+              value: "{executor_url}"
             # AUTH_SECRET_NAME is the name of the Secret containing auth.json.
             # Defaults to "ginger-society-auth" if unset.
             # - name: AUTH_SECRET_NAME
@@ -175,13 +175,13 @@ spec:
         name = CONTROLLER_NAME,
         ns = CONTROLLER_NAMESPACE,
         image = image,
-        sidekick_url = sidekick_url,
+        executor_url = executor_url,
     )
 }
 
 /// A reusable Tekton Task for pipeline authors who prefer taskRef over the CRD.
 /// Installed alongside the controller so developers have both options.
-fn render_tekton_task(sidekick_url: &str, runner_image: &str) -> String {
+fn render_tekton_task(executor_url: &str, runner_image: &str) -> String {
     format!(
         r#"apiVersion: tekton.dev/v1
 kind: Task
@@ -211,7 +211,7 @@ spec:
         - name: REMOTE_CLEANUP
           value: $(params.cleanup)
         - name: EXTERNAL_EXECUTOR_URL
-          value: "{sidekick_url}"
+          value: "{executor_url}"
       volumeMounts:
         - name: ginger-auth
           mountPath: /var/run/ginger-society
@@ -223,7 +223,7 @@ spec:
 "#,
         ns = CONTROLLER_NAMESPACE,
         runner_image = runner_image,
-        sidekick_url = sidekick_url,
+        executor_url = executor_url,
         auth_secret = AUTH_SECRET_NAME,
     )
 }

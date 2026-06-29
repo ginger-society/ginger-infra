@@ -50,7 +50,7 @@ itself in roughly 125 hours of build time.
 ## System Overview
 
 ```
-Any Invoker                  sidekick service               Device (any OS, any hardware)
+Any Invoker                  executor service               Device (any OS, any hardware)
     │                               │                                  │
     │── POST /run-job ─────────────>│                                  │
     │   {capability, script, env}   │                                  │
@@ -88,7 +88,7 @@ suitable device before dispatching a job.
 The NAT traversal and authentication layer. Devices connect outbound — no inbound
 ports, no firewall rules, no SSH keys needed.
 
-### sidekick service
+### executor service
 
 The HTTP/SSE adapter. Accepts job requests, finds a capable device, dispatches the
 job via WAMP RPC, streams output back to the caller. This is where complexity lives
@@ -96,7 +96,7 @@ so that the caller stays simple.
 
 ### ginger-infra CLI
 
-The caller-side tool. Reads script files, POSTs to the sidekick, streams SSE to
+The caller-side tool. Reads script files, POSTs to the executor, streams SSE to
 stdout, exits with the remote script's exit code. One command, works from any
 environment.
 
@@ -240,7 +240,7 @@ POST /run-job
   ├─ spawn task:
   │     call("rpc_job", device_channel, {
   │       job_id, script, env,
-  │       reply_channel: sidekick's WAMP channel
+  │       reply_channel: executor's WAMP channel
   │     })
   │     │
   │     ├─ Ok({exit_code}) → send JobEvent::Done
@@ -279,7 +279,7 @@ New jobs route to other replicas or the new pod once ready.
 3. Stream stdout/stderr lines to `reply_channel` as WAMP publish events
 4. Wait for process to exit
 5. Return `Ok({exit_code})` or `Err({exit_code, error})`
-   — this return is what unblocks the sidekick's `call()` and triggers cleanup
+   — this return is what unblocks the executor's `call()` and triggers cleanup
 
 ### `cleanup_job`
 
@@ -309,7 +309,7 @@ ginger-infra rpc-job \
 
 The CLI:
 1. Reads the `.sh` files from disk
-2. POSTs to the sidekick service
+2. POSTs to the executor service
 3. Streams SSE events to stdout (caller sees live logs)
 4. Exits with the `exit_code` from the `done` event
 
@@ -350,40 +350,6 @@ ginger-infra rpc-job \
   --cleanup    ./home/ac-off/cleanup.sh
 ```
 
----
-
-## Deployment
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: tekton-sidekick
-spec:
-  replicas: 2
-  template:
-    spec:
-      terminationGracePeriodSeconds: 3600
-      containers:
-        - name: tekton-sidekick
-          image: gingersociety/tekton-sidekick:latest
-          env:
-            - name: GINGER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: ginger-token-secret
-                  key: token
-            - name: NOTIFICATION_BROKER_URL
-              value: wss://api.gingersociety.org
-            - name: PRESENCE_SERVICE_URL
-              value: http://presence-service/presence
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 5
-            periodSeconds: 10
-```
 
 ---
 
@@ -397,7 +363,7 @@ spec:
 | Script exits non-zero | `call()` returns `Err({exit_code})` → SSE error → cleanup dispatched → caller exits 1 |
 | Cleanup script fails | Logged, ignored — never propagates to caller |
 | Caller disconnects mid-stream | SSE broken pipe → `cancel_job` RPC → cleanup dispatched → `in_flight` decremented when done |
-| Sidekick pod restarts | SIGTERM → drain → wait for all jobs AND cleanups → exit 0 |
+| executor pod restarts | SIGTERM → drain → wait for all jobs AND cleanups → exit 0 |
 
 ---
 
@@ -406,8 +372,8 @@ spec:
 | Layer | Responsibility |
 |---|---|
 | Any invoker | Provide script files, read SSE stream, act on exit code |
-| ginger-infra CLI | Read script files, POST to sidekick, stream SSE to stdout, propagate exit code |
-| sidekick service | Job dispatch, stream routing, cleanup orchestration, drain management |
+| ginger-infra CLI | Read script files, POST to executor, stream SSE to stdout, propagate exit code |
+| executor service | Job dispatch, stream routing, cleanup orchestration, drain management |
 | WAMP broker | Authenticated delivery, NAT traversal |
 | Presence service | Device discovery by capability |
 | ginger-infra agent | Script execution, stdout/stderr publishing, cleanup, process cancellation |
@@ -420,7 +386,7 @@ Nothing fighting anything else. Each layer does exactly one thing.
 # one-time, against whichever cluster KUBECONFIG points at:
 ginger-infra install-tekton-crd \
   --image gingersociety/remote-task-controller:latest \
-  --sidekick-url http://tekton-sidekick.infra.svc.cluster.local:8099/run-job
+  --executor-url http://tekton-executor.infra.svc.cluster.local:8099/run-job
 
 # verify:
 kubectl get crd remotetasks.gingersociety.org
