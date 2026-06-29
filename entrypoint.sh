@@ -72,7 +72,23 @@ fi
 # ── envrc ─────────────────────────────────────────────────────────────────────
 # CRED_* vars flow through here to the device. Controller-only vars that must
 # NOT reach the device:
-SKIP_VARS="REMOTE_SCRIPT REMOTE_CAPABILITY REMOTE_CLEANUP EXTERNAL_EXECUTOR_URL GINGER_AUTH_PATH HOME PATH"
+SKIP_VARS="REMOTE_SCRIPT REMOTE_CAPABILITY REMOTE_CLEANUP EXTERNAL_EXECUTOR_URL GINGER_AUTH_PATH HOME PATH PWD HOSTNAME done"
+
+env | while IFS='=' read -r key value; do
+  case "$key" in
+    *[!A-Za-z0-9_]*|'') continue ;;
+    KUBERNETES_*) continue ;;        # ← skip all KUBERNETES_* 
+    TEKTON_*) continue ;;            # ← skip all TEKTON_*
+  esac
+  skip=0
+  for s in $SKIP_VARS; do
+    [ "$key" = "$s" ] && skip=1 && break
+  done
+  [ "$skip" = "1" ] && continue
+  escaped=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
+  printf "export %s='%s'\n" "$key" "$escaped" >> "$ENVRC"
+done
+
 
 ENVRC=/tmp/.envrc
 : > "$ENVRC"

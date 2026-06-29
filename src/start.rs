@@ -106,6 +106,12 @@ pub async fn main(
                 let parsed: ExecuteArgs = serde_json::from_value(raw)
                     .map_err(|e| json!({"error": format!("invalid kwargs: {}", e)}))?;
 
+                // ── debug: print received env vars ───────────────────────────────────────
+                println!("[execute] job_id={} env vars received ({}):", parsed.job_id, parsed.env.len());
+                for (k, v) in &parsed.env {
+                    println!("[execute]   {}={}", k, v);
+                }
+
                 let job_dir = format!("/tmp/{}", parsed.job_id);
                 let script_path = format!("{}/run.sh", job_dir);
                 let cleanup_path = format!("{}/cleanup.sh", job_dir);
@@ -114,6 +120,10 @@ pub async fn main(
                 tokio::fs::create_dir_all(&job_dir)
                     .await
                     .map_err(|e| json!({"error": format!("failed to create job dir: {}", e)}))?;
+
+                tokio::process::Command::new("chmod")
+                    .args(["755", &job_dir])
+                    .status().await.ok();
 
                 tokio::fs::write(&script_path, &parsed.script)
                     .await
@@ -138,8 +148,14 @@ pub async fn main(
                 }
 
                 // ── 2. spawn run.sh ───────────────────────────────────────────
-                let mut cmd = tokio::process::Command::new("bash");
-                cmd.arg(&script_path)
+                let mut cmd = tokio::process::Command::new("sudo");
+                cmd.arg("-E")
+                    .arg("-u")
+                    .arg("rpc-runner")          // <── unprivileged user
+                    .arg("--")
+                    .arg("bash")
+                    .arg(&script_path)
+                    .current_dir("/tmp") 
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
 
@@ -229,9 +245,15 @@ pub async fn main(
                 if parsed.cleanup_script.is_some() {
                     println!("[execute] running cleanup.sh for job_id={}", parsed.job_id);
 
-                    let mut cleanup_cmd = tokio::process::Command::new("bash");
+                    let mut cleanup_cmd = tokio::process::Command::new("sudo");
                     cleanup_cmd
+                        .arg("-E")
+                        .arg("-u")
+                        .arg("rpc-runner")
+                        .arg("--")
+                        .arg("bash")
                         .arg(&cleanup_path)
+                        .current_dir("/tmp")
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped());
 
