@@ -11,13 +11,29 @@ use k8s_openapi::api::core::v1::{
     PodTemplateSpec, Secret, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Api, DeleteParams, ListParams, LogParams, PostParams, PropagationPolicy};
+use kube::api::{Api, DeleteParams, ListParams, LogParams, PatchParams, PostParams, PropagationPolicy};
 use kube::Client;
 use tokio_cron_scheduler::{Job as CronJob, JobScheduler};
+
+use futures_util::StreamExt;
+use ginger_infra::resticrestore::{
+    ResticRestore, ResticRestoreStatus, PHASE_FAILED, PHASE_PENDING, PHASE_RUNNING,
+    PHASE_SUCCEEDED, PHASE_WAITING_FOR_SCALE_DOWN,
+};
+use k8s_openapi::api::core::v1::PodTemplateSpec as _; // no-op, keeps existing imports tidy
+use kube::api::Patch;
+use kube::runtime::controller::{Action, Controller};
+use kube::runtime::watcher::Config as WatcherConfig;
+use serde_json::json;
 
 const ANNOTATION_ENABLED: &str = "snapshot.gingersociety.org/enabled";
 const ANNOTATION_SELECTED_NODE: &str = "volume.kubernetes.io/selected-node";
 const NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+
+fn repo_url(args: &Args, ns: &str, pvc: &str) -> String {
+    format!("s3:https://s3.amazonaws.com/{}/{}/{}", args.s3_base_path, ns, pvc)
+}
+
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "restic-snapshot-controller")]
@@ -396,9 +412,272 @@ async fn main() -> Result<()> {
     }
 
     println!("[restic-controller] scheduling backup sweep with cron '{}'", args.schedule);
-    let _sched = setup_scheduler(client, args.clone()).await?;
+    let _sched = setup_scheduler(client.clone(), args.clone()).await?;
+
+    println!("[restic-controller] starting ResticRestore reconciler");
+    let restore_client = client.clone();
+    let restore_args = args.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_restore_controller(restore_client, restore_args).await {
+            eprintln!("[restic-controller] restore controller exited with error: {e:?}");
+        }
+    });
 
     tokio::signal::ctrl_c().await?;
     println!("[restic-controller] shutting down");
+    Ok(())
+}
+
+// ── restore reconciler ───────────────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+enum RestoreError {
+    #[error("kube: {0}")]
+    Kube(#[from] kube::Error),
+    #[error("other: {0}")]
+    Other(#[from] anyhow::Error),
+}
+
+struct RestoreContext {
+    client: Client,
+    args: Arc<Args>,
+    controller_namespace: String,
+}
+
+async fn pod_attached_to_pvc(client: &Client, ns: &str, pvc_name: &str) -> Result<bool> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let list = pods.list(&ListParams::default()).await?;
+    for pod in list.items {
+        let terminal = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.phase.as_deref())
+            .map(|p| p == "Succeeded" || p == "Failed")
+            .unwrap_or(false);
+        if terminal {
+            continue;
+        }
+        let uses_pvc = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.volumes.as_ref())
+            .map(|vols| {
+                vols.iter().any(|v| {
+                    v.persistent_volume_claim
+                        .as_ref()
+                        .map(|c| c.claim_name == pvc_name)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if uses_pvc {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn build_restore_job(
+    restore: &ResticRestore,
+    run_id: &str,
+    args: &Args,
+    repo: &str,
+    creds: &Credentials,
+    node: Option<&str>,
+) -> Job {
+    let ns = restore.metadata.namespace.clone().unwrap_or_default();
+    let pvc_name = restore.spec.pvc_name.clone();
+    let job_name = format!("restic-restore-{}-{}", sanitize(&pvc_name), run_id);
+    let snapshot = restore.snapshot_ref();
+
+    let clean_step = if restore.spec.clean_existing_data {
+        format!("find /volumes-to-backup/{pvc} -mindepth 1 -delete\n", pvc = pvc_name)
+    } else {
+        String::new()
+    };
+
+    let script = format!(
+        "set -eu\n\
+         {clean_step}\
+         restic restore {snapshot} --target /volumes-to-backup/{pvc}\n\
+         echo '==> restored contents:'\n\
+         ls -la /volumes-to-backup/{pvc}\n",
+        clean_step = clean_step,
+        snapshot = snapshot,
+        pvc = pvc_name,
+    );
+
+    let mut labels = BTreeMap::new();
+    labels.insert("app.kubernetes.io/managed-by".to_string(), "restic-snapshot-controller".to_string());
+    labels.insert("snapshot.gingersociety.org/pvc".to_string(), pvc_name.clone());
+    labels.insert("snapshot.gingersociety.org/restore-run-id".to_string(), run_id.to_string());
+
+    let env = vec![
+        EnvVar { name: "RESTIC_REPOSITORY".into(), value: Some(repo.into()), ..Default::default() },
+        EnvVar { name: "RESTIC_PASSWORD".into(), value: Some(creds.restic_password.clone()), ..Default::default() },
+        EnvVar { name: "AWS_ACCESS_KEY_ID".into(), value: Some(creds.access_key.clone()), ..Default::default() },
+        EnvVar { name: "AWS_SECRET_ACCESS_KEY".into(), value: Some(creds.secret_key.clone()), ..Default::default() },
+    ];
+
+    let node_selector = node.map(|n| {
+        let mut m = BTreeMap::new();
+        m.insert("kubernetes.io/hostname".to_string(), n.to_string());
+        m
+    });
+
+    Job {
+        metadata: ObjectMeta {
+            name: Some(job_name),
+            namespace: Some(ns),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(JobSpec {
+            backoff_limit: Some(0),
+            ttl_seconds_after_finished: Some(300),
+            template: PodTemplateSpec {
+                metadata: None,
+                spec: Some(PodSpec {
+                    restart_policy: Some("Never".into()),
+                    node_selector,
+                    containers: vec![Container {
+                        name: "restic-restore".into(),
+                        image: Some(args.restic_image.clone()),
+                        command: Some(vec!["/bin/sh".into(), "-c".into(), script]),
+                        env: Some(env),
+                        volume_mounts: Some(vec![VolumeMount {
+                            name: "data".into(),
+                            mount_path: format!("/volumes-to-backup/{pvc_name}"),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }],
+                    volumes: Some(vec![Volume {
+                        name: "data".into(),
+                        persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                            claim_name: pvc_name.clone(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+async fn set_restore_status(
+    restores: &Api<ResticRestore>,
+    name: &str,
+    phase: &str,
+    message: &str,
+    terminal: bool,
+) -> Result<(), RestoreError> {
+    let mut status = json!({ "phase": phase, "message": message });
+    if terminal {
+        status["completionTime"] = json!(chrono::Utc::now().to_rfc3339());
+    }
+    let patch = json!({ "status": status });
+    restores
+        .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+async fn reconcile_restore(
+    restore: Arc<ResticRestore>,
+    ctx: Arc<RestoreContext>,
+) -> Result<Action, RestoreError> {
+    let name = restore.metadata.name.clone().unwrap_or_default();
+    let ns = restore.metadata.namespace.clone().unwrap_or_default();
+    let restores: Api<ResticRestore> = Api::namespaced(ctx.client.clone(), &ns);
+
+    if restore.is_terminal() {
+        return Ok(Action::await_change());
+    }
+
+    let pvc_name = restore.spec.pvc_name.clone();
+
+    // Confirm the PVC actually exists before doing anything else.
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), &ns);
+    let pvc = match pvcs.get(&pvc_name).await {
+        Ok(p) => p,
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            set_restore_status(&restores, &name, PHASE_FAILED, &format!("PVC '{pvc_name}' not found in namespace '{ns}'"), true).await?;
+            return Ok(Action::await_change());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // Safety check: refuse to restore into a PVC something is still using.
+    let attached = pod_attached_to_pvc(&ctx.client, &ns, &pvc_name).await.map_err(anyhow::Error::from)?;
+    if attached {
+        set_restore_status(
+            &restores,
+            &name,
+            PHASE_WAITING_FOR_SCALE_DOWN,
+            &format!("PVC '{pvc_name}' is still mounted by a running pod. Scale the owning workload to 0 replicas and this will proceed automatically."),
+            false,
+        ).await?;
+        return Ok(Action::requeue(Duration::from_secs(10)));
+    }
+
+    set_restore_status(&restores, &name, PHASE_RUNNING, "PVC is free, dispatching restore job", false).await?;
+
+    let node = if is_rwo(&pvc) { selected_node(&pvc) } else { None };
+    if is_rwo(&pvc) && node.is_none() {
+        set_restore_status(
+            &restores, &name, PHASE_FAILED,
+            &format!("PVC '{pvc_name}' is RWO with no {ANNOTATION_SELECTED_NODE} annotation; cannot place restore pod safely"),
+            true,
+        ).await?;
+        return Ok(Action::await_change());
+    }
+
+    let creds = fetch_credentials(&ctx.client, &ctx.controller_namespace, &ctx.args.credentials_secret_name)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let repo = repo_url(&ctx.args, &ns, &pvc_name);
+    let run_id = Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let job = build_restore_job(&restore, &run_id, &ctx.args, &repo, &creds, node.as_deref());
+
+    match run_backup_job(&ctx.client, job).await {
+        Ok(true) => {
+            set_restore_status(&restores, &name, PHASE_SUCCEEDED, "restore completed successfully", true).await?;
+        }
+        Ok(false) => {
+            set_restore_status(&restores, &name, PHASE_FAILED, "restore job reported failure; check controller logs", true).await?;
+        }
+        Err(e) => {
+            set_restore_status(&restores, &name, PHASE_FAILED, &format!("error dispatching restore job: {e}"), true).await?;
+        }
+    }
+
+    Ok(Action::await_change())
+}
+
+fn restore_error_policy(_r: Arc<ResticRestore>, err: &RestoreError, _ctx: Arc<RestoreContext>) -> Action {
+    eprintln!("[restic-controller] restore reconcile error: {err:?}");
+    Action::requeue(Duration::from_secs(15))
+}
+
+async fn run_restore_controller(client: Client, args: Arc<Args>) -> Result<()> {
+    let controller_namespace = resolve_controller_namespace(&args);
+    let ctx = Arc::new(RestoreContext { client: client.clone(), args, controller_namespace });
+
+    let restores: Api<ResticRestore> = Api::all(client.clone());
+
+    Controller::new(restores, WatcherConfig::default())
+        .run(reconcile_restore, restore_error_policy, ctx)
+        .for_each(|res| async move {
+            if let Err(e) = res {
+                eprintln!("[restic-controller] restore controller stream error: {e:?}");
+            }
+        })
+        .await;
+
     Ok(())
 }

@@ -8,10 +8,22 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
 use std::collections::BTreeMap;
+use ginger_infra::resticrestore::ResticRestore;
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use kube::CustomResourceExt;
 
 const FIELD_MANAGER: &str = "ginger-infra";
 const CONTROLLER_NAME: &str = "restic-snapshot-controller";
 const REQUIRED_SECRET_KEYS: [&str; 3] = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "RESTIC_PASSWORD"];
+
+async fn apply_crd(client: &Client) -> Result<()> {
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+    let crd = ResticRestore::crd();
+    let name = crd.metadata.name.clone().unwrap();
+    api.patch(&name, &PatchParams::apply(FIELD_MANAGER), &Patch::Apply(&crd)).await?;
+    println!("[install-restic-controller] installed CRD '{name}'");
+    Ok(())
+}
 
 pub async fn run_install_restic_controller(
     image: Option<&str>,
@@ -119,9 +131,9 @@ async fn apply_cluster_role(client: &Client) -> Result<()> {
         },
         rules: Some(vec![
             PolicyRule {
-                api_groups: Some(vec!["".into()]),
-                resources: Some(vec!["persistentvolumeclaims".into()]),
-                verbs: vec!["get".into(), "list".into(), "watch".into()],
+                api_groups: Some(vec!["gingersociety.org".into()]),
+                resources: Some(vec!["resticrestores".into(), "resticrestores/status".into()]),
+                verbs: vec!["get".into(), "list".into(), "watch".into(), "update".into(), "patch".into()],
                 ..Default::default()
             },
             PolicyRule {

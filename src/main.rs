@@ -26,6 +26,7 @@ mod autoclean;
 mod upload;
 mod install_tekton_crd;
 mod install_restic_controller;
+mod restore_restic_backup;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -106,6 +107,15 @@ enum Commands {
         #[arg(long)]
         namespace: Option<String>,
     },
+    RestoreResticBackup {
+        pvc_name: String,
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        #[arg(long, default_value_t = false)]
+        clean: bool,
+        #[arg(long)]
+        snapshot: Option<String>,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -129,6 +139,12 @@ async fn check_session_gurad(
     token: String,
 ) {
     match cli.command {
+        Commands::RestoreResticBackup { pvc_name, namespace, clean, snapshot } => {
+            if let Err(e) = restore_restic_backup::run_restore(&pvc_name, &namespace, clean, snapshot.as_deref()).await {
+                eprintln!("restore-restic-backup failed: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::InstallResticController { image, s3_base_path, schedule, credentials_secret_name, namespace } => {
             if let Err(e) = install_restic_controller::run_install_restic_controller(
                 image.as_deref(),
