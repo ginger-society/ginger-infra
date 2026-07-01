@@ -1,0 +1,41 @@
+# Dockerfile.restic-snapshot-controller
+#
+# Builds the restic-snapshot-controller binary.
+# The controller's job: find annotated PVCs, dispatch per-PVC restic backup
+# Jobs, print their logs, clean up. It shells out to restic inside the Job
+# containers it creates — this binary itself never calls restic directly.
+
+# ── Stage 1: build ────────────────────────────────────────────────────────────
+FROM gingersociety/rust-rocket-api-builder:latest AS builder
+
+WORKDIR /build
+ARG GINGER_TOKEN
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+RUN ginger-auth token-login $GINGER_TOKEN
+RUN ginger-connector connect prod
+
+ENV OPENSSL_STATIC=1
+RUN cargo build --release --bin restic-snapshot-controller
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin controller
+
+COPY --from=builder /build/target/release/restic-snapshot-controller \
+    /usr/local/bin/restic-snapshot-controller
+
+USER 10001
+
+ENTRYPOINT ["/usr/local/bin/restic-snapshot-controller"]

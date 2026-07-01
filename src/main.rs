@@ -25,6 +25,7 @@ mod rpc;
 mod autoclean;
 mod upload;
 mod install_tekton_crd;
+mod install_restic_controller;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -93,6 +94,18 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         overwrite: bool,
     },
+    InstallResticController {
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        s3_base_path: String,
+        #[arg(long)]
+        schedule: Option<String>,
+        #[arg(long)]
+        credentials_secret_name: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -116,6 +129,18 @@ async fn check_session_gurad(
     token: String,
 ) {
     match cli.command {
+        Commands::InstallResticController { image, s3_base_path, schedule, credentials_secret_name, namespace } => {
+            if let Err(e) = install_restic_controller::run_install_restic_controller(
+                image.as_deref(),
+                &s3_base_path,
+                schedule.as_deref(),
+                credentials_secret_name.as_deref(),
+                namespace.as_deref(),
+            ).await {
+                eprintln!("install-restic-controller failed: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::InstallTektonCrd { image, executor_url, runner_image } => {
             if let Err(e) = install_tekton_crd::run_install_tekton_crd(
                 image.as_deref(),

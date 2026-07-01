@@ -28,6 +28,27 @@ jobs:
       - name: Push controller image
         run: docker push gingersociety/remote-task-controller:latest
 
+
+  # ── Restic snapshot controller image ───────────────────────────────────────
+  build-and-push-restic-controller:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+
+      - name: Build restic snapshot controller image
+        run: |
+          docker build \
+            --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} \
+            -t gingersociety/restic-snapshot-controller:latest \
+            -f Dockerfile.restic-snapshot-controller \
+            .
+
+      - name: Push restic snapshot controller image
+        run: docker push gingersociety/restic-snapshot-controller:latest
   # ── Runner image ────────────────────────────────────────────────────────────
   build-and-push-runner:
     runs-on: ubuntu-22.04

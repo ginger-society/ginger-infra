@@ -5,39 +5,41 @@ spec_url = "/openapi.json"
 
 [services."@ginger-society/IAMService"]
 stage = "https://api.gingersociety.org/iam"
+prod = "https://api.gingersociety.org/iam"
 stage_k8 = "http://iam-service-api-service/iam"
 prod_k8 = "http://iam-service-api-service/iam"
-prod = "https://api.gingersociety.org/iam"
 
 [services."@ginger-society/MetadataService"]
 prod = "https://api.gingersociety.org/metadata"
 stage = "https://api.gingersociety.org/metadata"
 
-[services."@ginger-society/GingerBucket"]
-prod = "http://localhost:8089/api"
-
 [services."@ginger-society/GingerPresence"]
-stage = "https://api.gingersociety.org/presence"
 prod = "https://api.gingersociety.org/presence"
+stage = "https://api.gingersociety.org/presence"
+
+[services."@ginger-society/GingerBucket"]
+prod = "https://bucket.gingersociety.org/api"
+stage = "https://bucket.gingersociety.org/api"
 
 [portals_refs]
-
-[ws_refs."@ginger-society/MetadataService"]
-prod = ""
-stage = ""
 
 [ws_refs."@ginger-society/GingerPresence"]
 prod = ""
 stage = ""
 
 [ws_refs."@ginger-society/IAMService"]
-prod_k8 = ""
 stage = ""
-stage_k8 = ""
 prod = ""
+prod_k8 = ""
+stage_k8 = ""
+
+[ws_refs."@ginger-society/MetadataService"]
+prod = ""
+stage = ""
 
 [ws_refs."@ginger-society/GingerBucket"]
 prod = ""
+stage = ""
 
 [urls]
 
