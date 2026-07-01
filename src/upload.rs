@@ -2,8 +2,8 @@ use std::path::Path;
 
 use GingerBucket::{
     apis::default_api::{
-        upload_routes_create_upload, upload_routes_start_upload, upload_routes_upload_part,
-        UploadRoutesCreateUploadParams, UploadRoutesStartUploadParams, UploadRoutesUploadPartParams,
+        upload_routes_create_upload, upload_routes_start_upload,
+        UploadRoutesCreateUploadParams, UploadRoutesStartUploadParams,
     },
     get_configuration,
     models::StartUploadRequest,
@@ -11,12 +11,40 @@ use GingerBucket::{
 use GingerBucket::apis::Error as ApiError;
 
 use ginger_shared_rs::utils::get_token_from_file_storage;
-use reqwest::multipart::Form;
 use tokio::io::AsyncReadExt;
-
 
 const CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5MB
 use indicatif::{ProgressBar, ProgressStyle};
+
+fn multipart_boundary() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("----gingerboundary{:x}", nanos)
+}
+
+fn build_multipart_body(boundary: &str, part_number: i32, chunk: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(chunk.len() + 256);
+
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"part_number\"\r\n\r\n");
+    body.extend_from_slice(part_number.to_string().as_bytes());
+    body.extend_from_slice(b"\r\n");
+
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"chunk\"; filename=\"chunk\"\r\n",
+    );
+    body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+    body.extend_from_slice(chunk);
+    body.extend_from_slice(b"\r\n");
+
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+    body
+}
 
 pub async fn run_upload(bucket_path: &str, file: &str, overwrite: bool) {
     let path = Path::new(file);
@@ -46,7 +74,7 @@ pub async fn run_upload(bucket_path: &str, file: &str, overwrite: bool) {
     .await
     {
         Ok(r) => r,
-        Err(ApiError::ResponseError(ref e)) if e.status == reqwest::StatusCode::CONFLICT => {
+        Err(ApiError::ResponseError(ref e)) if e.status.as_u16() == 409 => {
             eprintln!(
                 "❌ File already exists at '{}/{}'.",
                 api_bucket_path, filename
@@ -100,23 +128,23 @@ pub async fn run_upload(bucket_path: &str, file: &str, overwrite: bool) {
             }
         };
 
-        let chunk = buf[..bytes_read].to_vec();
-
-        let form = Form::new()
-            .text("part_number", part_number.to_string())
-            .part(
-                "chunk",
-                reqwest::multipart::Part::bytes(chunk)
-                    .file_name("chunk")
-                    .mime_str("application/octet-stream")
-                    .unwrap(),
-            );
+        let chunk = &buf[..bytes_read];
+        let boundary = multipart_boundary();
+        let body = build_multipart_body(&boundary, part_number, chunk);
 
         let url = format!("{}/upload/{}", config.base_path, upload_id);
 
-        let mut req = config.client.post(&url).multipart(form);
+        let mut req = config
+            .client
+            .post(&url)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(body);
+
         if let Some(ref ua) = config.user_agent {
-            req = req.header(reqwest::header::USER_AGENT, ua.clone());
+            req = req.header("user-agent", ua.clone());
         }
 
         match req.send().await {
