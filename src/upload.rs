@@ -11,6 +11,7 @@ use GingerBucket::{
 use GingerBucket::apis::Error as ApiError;
 
 use ginger_shared_rs::utils::get_token_from_file_storage;
+use reqwest::multipart::Form;
 use tokio::io::AsyncReadExt;
 
 
@@ -101,7 +102,7 @@ pub async fn run_upload(bucket_path: &str, file: &str, overwrite: bool) {
 
         let chunk = buf[..bytes_read].to_vec();
 
-        let form = reqwest::multipart::Form::new()
+        let form = Form::new()
             .text("part_number", part_number.to_string())
             .part(
                 "chunk",
