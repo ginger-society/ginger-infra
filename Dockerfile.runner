@@ -16,7 +16,9 @@ RUN ginger-connector connect prod
 ENV OPENSSL_STATIC=1
 ENV OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu
 ENV OPENSSL_INCLUDE_DIR=/usr/include/openssl
-RUN cargo build --release --bin ginger-infra
+RUN cat GingerBucket_client/Cargo.toml IAMService_client/Cargo.toml MetadataService_client/Cargo.toml GingerPresence_client/Cargo.toml | grep -A2 reqwest
+
+RUN cargo build --release --bin ginger-infra --locked
 
 FROM debian:bookworm-slim
 
