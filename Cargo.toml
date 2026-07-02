@@ -13,6 +13,10 @@ path = "src/bin/remote-task-controller/main.rs"
 name = "restic-snapshot-controller"
 path = "src/bin/restic-snapshot-controller/main.rs"
 
+[[bin]]
+name = "public-registry-publisher"
+path = "src/bin/public-registry-publisher/main.rs"
+
 [package.metadata]
 organization = "ginger-society"
 
@@ -46,4 +50,12 @@ thiserror = "1"
 tokio-cron-scheduler = "0.10"
 chrono = "0.4"
 indicatif = "0.17"
-
+urlencoding = "2"
+clap_lex = "=0.7.0"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+hex = "0.4"

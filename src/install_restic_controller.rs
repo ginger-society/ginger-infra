@@ -40,6 +40,7 @@ pub async fn run_install_restic_controller(
 
     check_credentials_secret(&client, ns, secret_name).await?;
 
+    apply_crd(&client).await?;
     apply_service_account(&client, ns).await?;
     apply_cluster_role(&client).await?;
     apply_cluster_role_binding(&client, ns).await?;
@@ -140,6 +141,20 @@ async fn apply_cluster_role(client: &Client) -> Result<()> {
                 api_groups: Some(vec!["".into()]),
                 resources: Some(vec!["pods".into(), "pods/log".into()]),
                 verbs: vec!["get".into(), "list".into(), "watch".into()],
+                ..Default::default()
+            },
+            // NEW: the controller discovers backup targets by scanning PVCs
+            // cluster-wide for the snapshot.gingersociety.org/enabled annotation.
+            PolicyRule {
+                api_groups: Some(vec!["".into()]),
+                resources: Some(vec!["persistentvolumeclaims".into()]),
+                verbs: vec![
+                    "get".into(),
+                    "list".into(),
+                    "watch".into(),
+                    "update".into(),
+                    "patch".into(),
+                ],
                 ..Default::default()
             },
             PolicyRule {
