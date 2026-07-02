@@ -69,3 +69,24 @@ jobs:
 
       - name: Push runner image
         run: docker push gingersociety/external-executor-runner:latest
+
+  # ── Publisher image ──────────────────────────────────────────────────────────
+  build-and-push-publisher:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+
+      - name: Build publisher image
+        run: |
+          docker build \
+            --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} \
+            -t gingersociety/public-registry-publisher:latest \
+            -f Dockerfile.public-registry-publisher \
+            .
+
+      - name: Push publisher image
+        run: docker push gingersociety/public-registry-publisher:latest
