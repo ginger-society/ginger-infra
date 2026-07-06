@@ -75,7 +75,10 @@ SKIP_VARS="REMOTE_SCRIPT REMOTE_CAPABILITY REMOTE_CLEANUP EXTERNAL_EXECUTOR_URL 
 ENVRC=/tmp/.envrc
 : > "$ENVRC"
 
-env | while IFS='=' read -r key value; do
+env | while IFS= read -r line; do
+  key=${line%%=*}
+  value=${line#*=}
+
   case "$key" in
     *[!A-Za-z0-9_]*|'') continue ;;
     KUBERNETES_*) continue ;;
@@ -86,6 +89,7 @@ env | while IFS='=' read -r key value; do
     [ "$key" = "$s" ] && skip=1 && break
   done
   [ "$skip" = "1" ] && continue
+
   escaped=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
   printf "export %s='%s'\n" "$key" "$escaped" >> "$ENVRC"
 done
