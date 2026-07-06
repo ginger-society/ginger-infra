@@ -13,10 +13,6 @@ path = "src/bin/remote-task-controller/main.rs"
 name = "restic-snapshot-controller"
 path = "src/bin/restic-snapshot-controller/main.rs"
 
-[[bin]]
-name = "public-registry-publisher"
-path = "src/bin/public-registry-publisher/main.rs"
-
 [package.metadata]
 organization = "ginger-society"
 
@@ -33,7 +29,7 @@ tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-native-roots"]
 futures-util = "0.3.31"
 serde = {version = "1.0.166", features = ["derive"]}
 serde_json = {version = "1.0.100"}
-sysinfo = "0.30"
+sysinfo = "0.31"
 walkdir = "2"
 tera = "1"
 anyhow = "1"
@@ -59,3 +55,5 @@ sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
 hex = "0.4"
+prometheus = "0.13"
+once_cell = "1"

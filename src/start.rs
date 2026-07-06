@@ -2,11 +2,40 @@ use GingerPresence::{apis::default_api::routes_index, get_configuration};
 use IAMService::models::ValidateApiTokenResponse;
 use MetadataService::apis::{configuration::Configuration as MetadataConfiguration, default_api::{MetadataGetPackageVersionPlainTextParams, metadata_get_package_version_plain_text}};
 use ginger_shared_rs::utils::get_token_from_file_storage;
+use once_cell::sync::Lazy;
+use prometheus::{Encoder, GaugeVec, Opts, Registry, TextEncoder};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+use sysinfo::{Disks, System};
 
 use crate::{wamp_args, wamp_client::WampClient};
+
+// ── Prometheus metrics ──────────────────────────────────────────────────────
+//
+// Registered once as static gauges, re-set on every heartbeat tick, then
+// rendered to the real Prometheus text exposition format via TextEncoder.
+// Each series carries a `device_id` label so a receiver that aggregates
+// blobs from multiple devices can disambiguate them.
+
+static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
+
+macro_rules! gauge_vec {
+    ($name:expr, $help:expr) => {{
+        let g = GaugeVec::new(Opts::new($name, $help), &["device_id"]).unwrap();
+        METRICS_REGISTRY.register(Box::new(g.clone())).unwrap();
+        g
+    }};
+}
+
+static CPU_USAGE:  Lazy<GaugeVec> = Lazy::new(|| gauge_vec!("node_cpu_usage_percent", "CPU usage percent"));
+static MEM_USED:   Lazy<GaugeVec> = Lazy::new(|| gauge_vec!("node_memory_used_bytes", "Memory used, bytes"));
+static MEM_TOTAL:  Lazy<GaugeVec> = Lazy::new(|| gauge_vec!("node_memory_total_bytes", "Memory total, bytes"));
+static LOAD1:      Lazy<GaugeVec> = Lazy::new(|| gauge_vec!("node_load1", "1m load average"));
+static LOAD5:      Lazy<GaugeVec> = Lazy::new(|| gauge_vec!("node_load5", "5m load average"));
+static LOAD15:     Lazy<GaugeVec> = Lazy::new(|| gauge_vec!("node_load15", "15m load average"));
+static DISK_USED:  Lazy<GaugeVec> = Lazy::new(|| gauge_vec!("node_disk_used_bytes", "Disk used, bytes"));
+static DISK_TOTAL: Lazy<GaugeVec> = Lazy::new(|| gauge_vec!("node_disk_total_bytes", "Disk total, bytes"));
 
 
 #[derive(Deserialize)]
@@ -747,6 +776,7 @@ pub async fn main(
     // spawn heartbeat as a separate task
     let heartbeat_client = Arc::clone(&client);
     let heartbeat_capabilities = capabilities.clone();
+    let heartbeat_device_id = device_id.clone();
     let own_channel = client.channel().to_string();
 
     tokio::spawn(async move {
@@ -755,6 +785,15 @@ pub async fn main(
 
         let mut current_device_channel = device_channel.clone();
         let mut consecutive_failures: u32 = 0;
+
+        // ── node metrics collectors ─────────────────────────────────────────
+        //
+        // Kept alive across ticks (rather than re-created each time) so
+        // sysinfo's internal deltas — CPU % in particular — are accurate.
+        let mut sys = System::new();
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+        let mut disks = Disks::new_with_refreshed_list();
 
         loop {
             interval.tick().await;
@@ -785,15 +824,52 @@ pub async fn main(
                 continue;
             }
 
+            // ── collect node metrics (only if the "metrics" capability is enabled) ──
+            let metrics_text = if heartbeat_capabilities.iter().any(|c| c == "metrics") {
+                sys.refresh_cpu_usage();
+                sys.refresh_memory();
+                disks.refresh();
+                let load_avg = System::load_average();
+
+                let disk_used: u64 = disks
+                    .iter()
+                    .map(|d| d.total_space() - d.available_space())
+                    .sum();
+                let disk_total: u64 = disks.iter().map(|d| d.total_space()).sum();
+
+                let labels = [heartbeat_device_id.as_str()];
+                CPU_USAGE.with_label_values(&labels).set(sys.global_cpu_usage() as f64);
+                MEM_USED.with_label_values(&labels).set((sys.used_memory() * 1024) as f64);
+                MEM_TOTAL.with_label_values(&labels).set((sys.total_memory() * 1024) as f64);
+                LOAD1.with_label_values(&labels).set(load_avg.one);
+                LOAD5.with_label_values(&labels).set(load_avg.five);
+                LOAD15.with_label_values(&labels).set(load_avg.fifteen);
+                DISK_USED.with_label_values(&labels).set(disk_used as f64);
+                DISK_TOTAL.with_label_values(&labels).set(disk_total as f64);
+
+                let mut buffer = Vec::new();
+                if let Err(e) = TextEncoder::new().encode(&METRICS_REGISTRY.gather(), &mut buffer) {
+                    eprintln!("[heartbeat] failed to encode metrics: {}", e);
+                }
+                Some(String::from_utf8(buffer).unwrap_or_default())
+            } else {
+                None
+            };
+
+            let mut payload = json!({
+                "device_channel": own_channel,
+                "capabilities": heartbeat_capabilities,
+            });
+            if let Some(metrics_text) = metrics_text {
+                payload["metrics_text"] = json!(metrics_text);
+            }
+
             let result = heartbeat_client
                 .call(
                     "handle_heartbeat",
                     current_device_channel.clone(),
                     json!([]),
-                    json!({
-                        "device_channel": own_channel,
-                        "capabilities": heartbeat_capabilities,
-                    }),
+                    payload,
                 )
                 .await;
 

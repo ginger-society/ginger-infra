@@ -386,7 +386,8 @@ Nothing fighting anything else. Each layer does exactly one thing.
 # one-time, against whichever cluster KUBECONFIG points at:
 ginger-infra install-tekton-crd \
   --image gingersociety/remote-task-controller:latest \
-  --executor-url http://tekton-executor.infra.svc.cluster.local:8099/run-job
+  --executor-url https://api.gingersociety.org/external-executor/run-job \
+  --runner-image gingersociety/external-executor-runner:latest
 
 # verify:
 kubectl get crd remotetasks.gingersociety.org
@@ -416,3 +417,54 @@ kubectl patch deployment remote-task-controller -n tekton-pipelines --type='json
     }
   }
 ]'
+
+
+
+Create the user (no login shell, no home dir needed):
+
+bash   useradd --system --no-create-home --shell /usr/sbin/nologin rpc-runner
+
+Allow the main process user to sudo as rpc-runner without a password — add to /etc/sudoers.d/rpc-runner:
+
+   your-main-user ALL=(rpc-runner) NOPASSWD: ALL
+
+
+
+  
+On macOS, use dscl instead:
+bash# 1. Pick a unique UID (check existing ones first)
+dscl . -list /Users UniqueID | sort -k2 -n | tail -5
+
+# 2. Create the user
+sudo dscl . -create /Users/rpc-runner
+sudo dscl . -create /Users/rpc-runner UserShell /usr/bin/false
+sudo dscl . -create /Users/rpc-runner RealName "RPC Runner"
+sudo dscl . -create /Users/rpc-runner UniqueID 499        # use an unused ID < 500 (system users)
+sudo dscl . -create /Users/rpc-runner PrimaryGroupID 20   # staff group
+sudo dscl . -create /Users/rpc-runner NFSHomeDirectory /var/empty
+
+# 3. Verify
+dscl . -read /Users/rpc-runner
+Then the sudoers rule — macOS uses the same /etc/sudoers.d/ approach:
+sudo visudo -f /etc/sudoers.d/rpc-runner
+Add:
+your-macos-username ALL=(rpc-runner) NOPASSWD: ALL
+Verify sudo works:
+bashsudo -u rpc-runner whoami
+# should print: rpc-runner
+
+add programs to this runner account by adding in sudo visudo -f /etc/sudoers.d/rpc-runner
+
+# rpc-runner can only run these specific binaries as itself
+rpc-runner ALL=(rpc-runner) NOPASSWD: /usr/local/bin/ginger-connector, /usr/local/bin/docker, /usr/bin/git
+
+
+
+sudo mkdir -p /etc/ginger-society/hooks
+sudo cp rpc_creds.sh /etc/ginger-society/hooks/rpc_creds.sh
+sudo chmod 755 /etc/ginger-society/hooks/rpc_creds.sh
+
+
+
+The CLI output should be unambiguous under stress. Right now it prints phase transitions as they happen, which is good, but consider also printing the exact kubectl get resticrestore <name> -o yaml command at the start, so whoever's running this (possibly not you, possibly at 3am) has a fallback way to inspect state if the CLI process itself dies mid-poll — the CR is already durable in etcd, so the record persists even if the terminal session doesn't.
+snapshot_id defaulting to "latest" is a footgun in a real incident. In a genuine DR scenario, "latest" might be a snapshot taken minutes before the mishap that already contains corrupted data, or (worse) might not exist yet if the backup job hadn't run since the incident started. Worth having the CLI print the available snapshot list before creating the CR, so the operator explicitly picks one rather than silently trusting "latest":
