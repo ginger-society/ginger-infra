@@ -1,0 +1,72 @@
+# .tekton/cd.yaml
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: build-pipeline
+  annotations:
+    x-gitter-trigger-branch: '["refs/heads/main", "refs/heads/dev-*"]'
+    x-gitter-enabled: "true"
+spec:
+  params:
+    - name: image_tag
+      type: string
+  tasks:
+    - name: macos-builds
+      runAfter:
+        - init-credentials
+      taskRef:
+        apiVersion: gingersociety.org/v1alpha1
+        kind: RemoteTask
+        name: macos-builds
+      params:
+        - name: namespace
+          value: default
+        - name: env          
+          value: |
+            - name: GIT_REPO_NAME
+              value: "$(params.repo)"
+            - name: IMAGE_TAG
+              value: "$(params.image_tag)"
+
+    - name: build-amd64-linux-and-windows
+      runAfter:
+        - clone
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: build-amd64-linux-and-windows
+          - name: namespace
+            value: default
+
+    - name: docker-arm64-linux-build
+      runAfter:
+        - init-credentials
+      taskRef:
+        apiVersion: gingersociety.org/v1alpha1
+        kind: RemoteTask
+        name: docker-arm64-linux-build
+      params:
+        - name: namespace
+          value: default
+        - name: env          
+          value: |
+            - name: GIT_REPO_NAME
+              value: "$(params.repo)"
+            - name: IMAGE_TAG
+              value: "$(params.image_tag)"
+
+    - name: notify-version-update
+      runAfter:
+        - macos-builds
+        - build-amd64-linux-and-windows
+        - docker-arm64-linux-build
+      taskSpec:
+        steps:
+          - name: echo
+            image: alpine
+            script: |
+              #!/bin/sh
+              echo "Hello World - both previous tasks are done!"
