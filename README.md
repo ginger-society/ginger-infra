@@ -458,7 +458,7 @@ add programs to this runner account by adding in sudo visudo -f /etc/sudoers.d/r
 # rpc-runner can only run these specific binaries as itself
 rpc-runner ALL=(rpc-runner) NOPASSWD: /usr/local/bin/ginger-connector, /usr/local/bin/docker, /usr/bin/git
 
-
+chmod +a "rpc-runner allow read,write" ~/.docker/run/docker.sock
 
 sudo mkdir -p /etc/ginger-society/hooks
 sudo cp rpc_creds.sh /etc/ginger-society/hooks/rpc_creds.sh

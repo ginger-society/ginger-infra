@@ -20,6 +20,37 @@
 //! but the kube-rs ListParams label selector does not escape them, causing the
 //! API server to reject the selector with a 400. Use a plain key instead.
 //!
+//! ## Referencing a standalone RemoteTask (optionally cross-namespace)
+//!
+//! Tekton's own `taskRef.name` only resolves a Task in the same namespace as
+//! the PipelineRun. We extend that: a PipelineTask can set
+//!
+//!   taskRef:
+//!     apiVersion: gingersociety.org/v1alpha1
+//!     kind: RemoteTask
+//!     name: my-shared-remote-task
+//!   params:
+//!     - name: namespace
+//!       value: shared-tasks   # optional, defaults to the CustomRun's own ns
+//!
+//! When `taskRef.name` is set, the controller looks up that standalone
+//! `RemoteTask` object (in `namespace` if given, else the CustomRun's own
+//! namespace) and pulls `capability` / `script` / `cleanup` / `env` from its
+//! spec, instead of requiring them as inline params. This lets teams define
+//! a `RemoteTask` once in a shared namespace and reference it from many
+//! pipelines, the same way a standard Tekton Task is referenced by name.
+//!
+//! Inline `env` params are still honoured alongside a `name` ref — they are
+//! merged in as *extra* env vars on top of the referenced RemoteTask's own
+//! `env`, useful for per-invocation overrides. `capability`, `script`, and
+//! `cleanup` always come from the referenced object when a ref is used.
+//!
+//! The TaskRun this controller creates is always owned by the CustomRun (same
+//! namespace) regardless of where the referenced RemoteTask definition lives
+//! — Kubernetes owner references must be same-namespace, so cross-namespace
+//! referencing only affects where we *read* the task definition from, not
+//! who owns the resulting TaskRun.
+//!
 //! ## Credentials / workspace
 //!
 //! Previously the runner mounted a Kubernetes Secret containing auth.json.
@@ -42,6 +73,9 @@ use kube::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use ginger_infra::remote_task::RemoteTask;
+
+use crate::remotetask::build_env;
 use crate::taskrun::{create_taskrun, TaskRunSpec};
 
 pub const CUSTOMRUN_GROUP: &str = "tekton.dev";
@@ -60,6 +94,11 @@ const CUSTOMRUN_LABEL: &str = "remotetask-customrun";
 /// to. Must match the name declared in the Pipeline's `workspaces:` list and
 /// the name used in taskrun.rs.
 const CREDS_WORKSPACE_NAME: &str = "creds";
+
+/// Optional param naming the namespace to look up a `taskRef.name`-referenced
+/// standalone RemoteTask in. Defaults to the CustomRun's own namespace when
+/// omitted. Only meaningful when `customRef.name` is set.
+const NAMESPACE_PARAM: &str = "namespace";
 
 const REQUEUE_AFTER_ERROR_SECS: u64 = 15;
 const REQUEUE_WHILE_RUNNING_SECS: u64 = 5;
@@ -106,6 +145,11 @@ struct CustomRef {
     #[serde(rename = "apiVersion")]
     api_version: Option<String>,
     kind: Option<String>,
+    /// When set, this CustomRun refers to a standalone RemoteTask object
+    /// rather than declaring capability/script/cleanup/env fully inline.
+    /// See the module-level docs for how this is resolved.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,6 +230,10 @@ fn parse_params(params: &[Param]) -> Result<ParsedSpec, CustomRunError> {
                     env = parsed;
                 }
             }
+            // Only meaningful when customRef.name is set (see resolve_task_spec);
+            // recognized here too so it doesn't trigger the "unrecognized param"
+            // warning on the inline-only path.
+            NAMESPACE_PARAM => {}
             other => eprintln!("[customrun] ignoring unrecognized param '{other}'"),
         }
     }
@@ -195,6 +243,63 @@ fn parse_params(params: &[Param]) -> Result<ParsedSpec, CustomRunError> {
         script: script
             .ok_or_else(|| CustomRunError::ParamParse("missing required param 'script'".into()))?,
         cleanup,
+        env,
+    })
+}
+
+/// Resolve the task spec either from inline params (the default, legacy
+/// path) or by looking up a standalone RemoteTask object referenced via
+/// `customRef.name` — optionally in another namespace via the `namespace`
+/// param, defaulting to the CustomRun's own namespace.
+///
+/// This mirrors how a Tekton `taskRef.name` points at a reusable Task
+/// object instead of inlining its behaviour on every PipelineTask, but
+/// extends it to allow the referenced object to live in a different
+/// namespace than the pipeline itself.
+async fn resolve_task_spec(
+    client: &Client,
+    customrun_ns: &str,
+    custom_ref_name: Option<&str>,
+    params: &[Param],
+) -> Result<ParsedSpec, CustomRunError> {
+    let Some(ref_name) = custom_ref_name else {
+        return parse_params(params);
+    };
+
+    let target_ns = params
+        .iter()
+        .find(|p| p.name == NAMESPACE_PARAM)
+        .and_then(|p| p.value.as_str())
+        .unwrap_or(customrun_ns);
+
+    println!("[customrun] resolving taskRef.name '{ref_name}' in namespace '{target_ns}'");
+
+    let api: Api<RemoteTask> = Api::namespaced(client.clone(), target_ns);
+    let remote_task = api.get_opt(ref_name).await?.ok_or_else(|| {
+        CustomRunError::ParamParse(format!(
+            "referenced RemoteTask '{target_ns}/{ref_name}' not found"
+        ))
+    })?;
+
+    let mut env = build_env(&remote_task.spec.env);
+
+    // Inline `env` param(s), if present, add extra env vars on top of the
+    // referenced RemoteTask's own env — useful for per-invocation overrides.
+    // capability/script/cleanup always come from the referenced object.
+    for p in params {
+        if p.name == "env" {
+            if let Some(raw) = p.value.as_str() {
+                let extra: Vec<serde_json::Value> = serde_yaml::from_str(raw)
+                    .map_err(|e| CustomRunError::ParamParse(format!("env: {e}")))?;
+                env.extend(extra);
+            }
+        }
+    }
+
+    Ok(ParsedSpec {
+        capability: remote_task.spec.capability.clone(),
+        script: remote_task.spec.script.clone(),
+        cleanup: remote_task.spec.cleanup.clone(),
         env,
     })
 }
@@ -277,8 +382,16 @@ pub async fn reconcile_customrun(
             )))
         }
         None => {
-            // No TaskRun yet — parse params and create one.
-            let parsed = match parse_params(&spec.params) {
+            // No TaskRun yet — resolve the spec, either inline or via a
+            // referenced standalone RemoteTask, then create the TaskRun.
+            let parsed = match resolve_task_spec(
+                &ctx.client,
+                &ns,
+                custom_ref.name.as_deref(),
+                &spec.params,
+            )
+            .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     set_failed(&customruns, &name, &format!("invalid params: {e}")).await?;
